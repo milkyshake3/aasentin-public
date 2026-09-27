@@ -60,6 +60,38 @@ class Config(BaseSettings):
         default="SOL/USDT",
         description="Trading pair symbol to monitor and protect",
     )
+    timeframe: str = Field(
+        default="15m",
+        description="Candle timeframe for OHLCV strategy analysis (e.g. '15m')",
+    )
+    allocation_pct: float = Field(
+        default=0.25,
+        ge=0.01,
+        le=1.0,
+        description="Fraction of free quote asset (USDT) to allocate per entry (e.g. 0.25 for 25%)",
+    )
+    dynamic_universe_size: int = Field(
+        default=15,
+        ge=1,
+        description="Number of top volume assets to monitor in dynamic universe (default 15)",
+    )
+    max_active_positions: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum concurrent active slot positions (default 3)",
+    )
+    slot_allocation_pct: float = Field(
+        default=0.25,
+        ge=0.01,
+        le=1.0,
+        description="Fraction of free quote asset to allocate per slot entry (default 0.25 for 25%)",
+    )
+    cooldown_minutes: int = Field(
+        default=15,
+        ge=0,
+        description="Cooldown sleep duration in minutes after a position is closed before scanning for re-entry",
+    )
     entry_price: Optional[float] = Field(
         default=None,
         description="Initial position cost basis. If None, captures initial market price at launch",
@@ -67,12 +99,12 @@ class Config(BaseSettings):
 
     # Mathematical Risk Engine Thresholds
     take_profit_pct: float = Field(
-        default=0.10,
-        description="Hard mathematical Take-Profit limit (e.g. 0.10 for +10%)",
+        default=0.05,
+        description="Hard mathematical Take-Profit limit (e.g. 0.05 for +5%)",
     )
     stop_loss_pct: float = Field(
-        default=0.04,
-        description="Hard mathematical Stop-Loss limit (e.g. 0.04 for -4%)",
+        default=0.025,
+        description="Hard mathematical Stop-Loss limit (e.g. 0.025 for -2.5%)",
     )
     panic_sell_confidence_threshold: float = Field(
         default=0.70,
@@ -104,6 +136,11 @@ class Config(BaseSettings):
         default=5.0,
         description="News watcher ingestion polling interval in seconds",
     )
+    max_news_age_minutes: int = Field(
+        default=30,
+        ge=1,
+        description="Maximum age of news articles in minutes for freshness validation",
+    )
 
     # Simulation & Testing Toggles
     mock_exchange: bool = Field(
@@ -117,6 +154,16 @@ class Config(BaseSettings):
     enable_rss_news: bool = Field(
         default=True,
         description="If True, polls public crypto RSS feeds for live breaking news",
+    )
+
+    # Discord Notification Subsystem
+    discord_webhook_url: str = Field(
+        default="",
+        description="Discord incoming webhook URL for real-time trade and threat alerts",
+    )
+    hourly_summary_enabled: bool = Field(
+        default=True,
+        description="If True, runs automated hourly Discord performance reports aligned to the top of the hour",
     )
 
     @field_validator("take_profit_pct")
@@ -137,11 +184,47 @@ class Config(BaseSettings):
             raise ValueError(f"STOP_LOSS_PCT must be less than 1.0 (100%), got {v}")
         return v
 
+    @field_validator("allocation_pct", "slot_allocation_pct")
+    @classmethod
+    def validate_allocation(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"Allocation percentage must be between 0.0 and 1.0, got {v}")
+        return v
+
+    @field_validator("dynamic_universe_size", "max_active_positions")
+    @classmethod
+    def validate_positive_counts(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"Universe size and position counts must be strictly positive, got {v}")
+        return v
+
+    @field_validator("cooldown_minutes")
+    @classmethod
+    def validate_cooldown(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"COOLDOWN_MINUTES must be non-negative, got {v}")
+        return v
+
+    @field_validator("timeframe")
+    @classmethod
+    def validate_timeframe(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if not clean:
+            raise ValueError("TIMEFRAME cannot be empty")
+        return clean
+
     @field_validator("poll_interval_seconds", "news_poll_interval_seconds")
     @classmethod
     def validate_positive_interval(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"Polling intervals must be strictly positive, got {v}")
+        return v
+
+    @field_validator("max_news_age_minutes")
+    @classmethod
+    def validate_max_news_age(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"MAX_NEWS_AGE_MINUTES must be strictly positive, got {v}")
         return v
 
     @field_validator("panic_sell_confidence_threshold")

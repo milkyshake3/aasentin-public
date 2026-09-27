@@ -18,6 +18,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional
 import ccxt.async_support as ccxt
 from ccxt.base.decimal_to_precision import decimal_to_precision, TRUNCATE, DECIMAL_PLACES, TICK_SIZE
+import pandas as pd
 from pydantic import BaseModel, Field
 
 from sentinel_trader.config import Config
@@ -56,6 +57,7 @@ class ExchangeClient:
         self._mock_prices: Dict[str, float] = {
             self.config.target_symbol: float(self.config.entry_price or 150.0),
         }
+        self._mock_ohlcv: Optional[pd.DataFrame] = None
 
     @property
     def is_mock(self) -> bool:
@@ -129,6 +131,54 @@ class ExchangeClient:
     # Backwards-compatible alias for existing callers
     get_current_price = get_ticker_price
 
+    @property
+    def markets(self) -> Dict[str, Any]:
+        """Expose CCXT exchange markets dict if loaded, or empty dict in mock mode."""
+        if self._exchange is not None and hasattr(self._exchange, "markets"):
+            return self._exchange.markets or {}
+        return {}
+
+    async def fetch_tickers(
+        self,
+        symbols: Optional[list] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch 24h ticker data for all or specified symbols from Binance or mock ledger."""
+        if self.is_mock:
+            default_pairs = [
+                ("BTC/USDT", 65000.0, 150000000.0),
+                ("ETH/USDT", 3500.0, 90000000.0),
+                ("SOL/USDT", 150.0, 50000000.0),
+                ("AVAX/USDT", 30.0, 20000000.0),
+                ("LINK/USDT", 15.0, 15000000.0),
+                ("NEAR/USDT", 5.0, 10000000.0),
+                ("USDC/USDT", 1.0, 300000000.0),
+                ("FDUSD/USDT", 1.0, 120000000.0),
+                ("BTCUP/USDT", 25.0, 5000000.0),
+                ("BTCDOWN/USDT", 10.0, 4000000.0),
+            ]
+            result = {}
+            for sym, def_p, def_qv in default_pairs:
+                if symbols and sym not in symbols:
+                    continue
+                p = float(self._mock_prices.get(sym, def_p))
+                result[sym] = {
+                    "symbol": sym,
+                    "last": p,
+                    "close": p,
+                    "quoteVolume": def_qv,
+                    "baseVolume": def_qv / p,
+                    "spot": True,
+                    "active": True,
+                }
+            return result
+
+        try:
+            return await self._exchange.fetch_tickers(symbols=symbols, params=params or {})
+        except Exception as e:
+            logger.error("Failed to fetch tickers: %s", e)
+            raise
+
     async def get_balance(self, asset: Optional[str] = None) -> float:
         """Fetch real free balance of the asset on Binance Testnet or mock ledger."""
         target_asset = asset or self.config.base_asset
@@ -176,6 +226,80 @@ class ExchangeClient:
             logger.debug("Error during exchange truncate_amount: %s. Using Decimal fallback.", e)
             d = Decimal(str(amount))
             return float(d.quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+
+    def amount_to_precision(self, symbol: str, amount: float) -> float:
+        """Format order quantity truncated downward according to exchange LOT_SIZE step precision."""
+        if self._exchange is not None and hasattr(self._exchange, "amount_to_precision"):
+            try:
+                prec_str = self._exchange.amount_to_precision(symbol, amount)
+                return float(prec_str)
+            except Exception:
+                pass
+        return self.truncate_amount(symbol, amount)
+
+    async def fetch_ohlcv_dataframe(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: str = "15m",
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Fetch historical OHLCV data as a Pandas DataFrame.
+
+        If running in mock simulation mode, generates realistic synthetic OHLCV candles
+        or returns injected mock candles if set.
+        In live/sandbox mode, fetches real candles via CCXT exchange.fetch_ohlcv.
+
+        Args:
+            symbol: Trading pair symbol (e.g. 'SOL/USDT'). Defaults to config.target_symbol.
+            timeframe: Candle timeframe interval (e.g. '15m', '1h').
+            limit: Maximum number of candles to return (default 200).
+
+        Returns:
+            pd.DataFrame: Columns ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        """
+        sym = symbol or self.config.target_symbol
+
+        if self.is_mock:
+            if self._mock_ohlcv is not None and not self._mock_ohlcv.empty:
+                return self._mock_ohlcv.copy()
+
+            # Generate deterministic synthetic OHLCV candles
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            interval_ms = 15 * 60 * 1000
+            base_p = float(self._mock_prices.get(sym, 150.0))
+
+            rows = []
+            price = base_p
+            for i in range(limit):
+                ts = now_ms - ((limit - i) * interval_ms)
+                open_p = price
+                reversion = (base_p - price) * 0.05
+                noise = random.gauss(0, 0.005) * price
+                close_p = max(0.01, round(price + reversion + noise, 4))
+                high_p = round(max(open_p, close_p) * (1.0 + random.uniform(0.0005, 0.002)), 4)
+                low_p = round(min(open_p, close_p) * (1.0 - random.uniform(0.0005, 0.002)), 4)
+                vol = round(random.uniform(500.0, 5000.0), 2)
+                rows.append([ts, open_p, high_p, low_p, close_p, vol])
+                price = close_p
+
+            return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        try:
+            raw_candles = await self._exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            if not raw_candles:
+                logger.warning("Empty OHLCV data received for %s (%s)", sym, timeframe)
+                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+            df = pd.DataFrame(
+                raw_candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
+        except Exception as e:
+            logger.error("Failed to fetch OHLCV dataframe for %s (%s): %s", sym, timeframe, e)
+            raise
 
     async def liquidate_to_usdt(
         self,
@@ -414,6 +538,191 @@ class ExchangeClient:
 
     # Backwards-compatible alias for existing codebase
     execute_market_sell = liquidate_to_usdt
+
+    async def execute_market_buy_idempotent(
+        self,
+        symbol: Optional[str] = None,
+        cost_usdt: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Execute a spot market buy order idempotently with precision-truncated sizing.
+
+        Guarantees:
+        1. Serialized execution via _order_lock.
+        2. Idempotent clientOrderId tracking with network partition recovery.
+        3. Exchange LOT_SIZE and MIN_NOTIONAL compliance with ROUND_DOWN precision.
+        4. Mock ledger synchronization in simulation mode.
+
+        Args:
+            symbol: Trading pair symbol (e.g. 'SOL/USDT').
+            cost_usdt: Total quote asset (USDT) amount to allocate for this buy.
+
+        Returns:
+            Dict[str, Any]: Execution order details including 'id', 'symbol', 'side',
+                            'amount', 'price', 'cost', and 'status'.
+        """
+        async with self._order_lock:
+            sym = symbol or self.config.target_symbol
+            base_asset = sym.split("/")[0]
+            quote_asset = sym.split("/")[1] if "/" in sym else "USDT"
+
+            if cost_usdt <= 0.0:
+                raise ValueError(f"Cannot execute market buy with non-positive cost_usdt: {cost_usdt}")
+
+            current_price = await self.get_ticker_price(sym)
+            raw_amount = cost_usdt / current_price
+            formatted_amount = self.amount_to_precision(sym, raw_amount)
+
+            if formatted_amount <= 0.0:
+                raise ValueError(
+                    f"Calculated buy amount {formatted_amount} is non-positive for cost ${cost_usdt:.2f} at price ${current_price:.4f}"
+                )
+
+            client_order_id = f"sentinel_buy_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+            # Handling Mock Exchange Execution
+            if self.is_mock:
+                free_usdt = self._mock_balances.get(quote_asset, 0.0)
+                actual_cost = formatted_amount * current_price
+                if free_usdt < actual_cost:
+                    logger.warning(
+                        "[MOCK BUY] Insufficient mock USDT balance ($%.2f < $%.2f). Adjusting cost to free balance.",
+                        free_usdt,
+                        actual_cost,
+                    )
+                    actual_cost = free_usdt
+                    formatted_amount = self.amount_to_precision(sym, actual_cost / current_price)
+
+                self._mock_balances[quote_asset] = max(0.0, self._mock_balances.get(quote_asset, 0.0) - actual_cost)
+                self._mock_balances[base_asset] = self._mock_balances.get(base_asset, 0.0) + formatted_amount
+
+                logger.info(
+                    "[MOCK ORDER FILLED] Market Buy %s | Amount: %.4f | Price: $%.4f | Cost: $%.2f | ClientId: %s",
+                    sym, formatted_amount, current_price, actual_cost, client_order_id,
+                )
+                return {
+                    "id": client_order_id,
+                    "clientOrderId": client_order_id,
+                    "symbol": sym,
+                    "side": "buy",
+                    "amount": formatted_amount,
+                    "price": current_price,
+                    "cost": actual_cost,
+                    "status": "closed",
+                    "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    "info": {"mode": "mock"},
+                }
+
+            # Real / Testnet CCXT Execution
+            try:
+                market_res = self._exchange.market(sym)
+                market = await market_res if hasattr(market_res, "__await__") else market_res
+                min_lot = market.get("limits", {}).get("amount", {}).get("min")
+                min_notional = market.get("limits", {}).get("cost", {}).get("min")
+                estimated_notional = formatted_amount * current_price
+
+                if min_lot and formatted_amount < min_lot:
+                    raise ValueError(
+                        f"Order amount {formatted_amount} is below exchange LOT_SIZE min {min_lot} for {sym}"
+                    )
+                if min_notional and estimated_notional < min_notional:
+                    raise ValueError(
+                        f"Order notional ${estimated_notional:.2f} is below MIN_NOTIONAL ${min_notional:.2f} for {sym}"
+                    )
+
+                async def _submit_buy_attempt(coid: str) -> Dict[str, Any]:
+                    logger.info(
+                        "Submitting MARKET BUY order for %s: Amount=%.4f (Cost~$%.2f, ClientId=%s)",
+                        sym, formatted_amount, cost_usdt, coid,
+                    )
+                    params = {"clientOrderId": coid}
+                    return await self._exchange.create_market_buy_order(sym, formatted_amount, params)
+
+                order = None
+                try:
+                    order = await _submit_buy_attempt(client_order_id)
+                except (ccxt.NetworkError, ccxt.RequestTimeout, asyncio.TimeoutError) as net_err:
+                    logger.warning(
+                        "[NETWORK PARTITION] Buy order submission encountered network error: %s. "
+                        "Checking exchange state for clientOrderId %s before retrying...",
+                        net_err, client_order_id,
+                    )
+                    await asyncio.sleep(1.0)
+                    post_base = await self.get_balance(base_asset)
+                    if post_base >= (formatted_amount * 0.9):
+                        logger.info(
+                            "[PARTITION RECOVERED] Base balance increased on exchange. Buy order executed."
+                        )
+                        order = {
+                            "id": client_order_id,
+                            "clientOrderId": client_order_id,
+                            "status": "closed",
+                            "filled": formatted_amount,
+                            "average": current_price,
+                            "price": current_price,
+                            "cost": formatted_amount * current_price,
+                        }
+                    else:
+                        open_orders = await self._exchange.fetch_open_orders(sym)
+                        matching = [o for o in open_orders if o.get("clientOrderId") == client_order_id]
+                        if matching:
+                            logger.info("[PARTITION RECOVERED] Found matching open order: %s", matching[0].get("id"))
+                            order = matching[0]
+                        else:
+                            trades = await self._exchange.fetch_my_trades(sym, limit=5)
+                            now_ms = datetime.now(timezone.utc).timestamp() * 1000
+                            recent_buys = [
+                                t for t in trades
+                                if t.get("side") == "buy" and (now_ms - t.get("timestamp", 0) < 30000)
+                            ]
+                            if recent_buys:
+                                logger.info("[PARTITION RECOVERED] Found recent buy trades on exchange.")
+                                avg_p = sum(t["price"] * t["amount"] for t in recent_buys) / sum(t["amount"] for t in recent_buys)
+                                tot_f = sum(t["amount"] for t in recent_buys)
+                                order = {
+                                    "id": str(recent_buys[-1].get("order", client_order_id)),
+                                    "clientOrderId": client_order_id,
+                                    "status": "closed",
+                                    "filled": tot_f,
+                                    "average": avg_p,
+                                    "price": avg_p,
+                                    "cost": tot_f * avg_p,
+                                }
+                            else:
+                                logger.warning("[PARTITION CONFIRMED] Buy was not executed on exchange. Retrying once safely...")
+                                order = await _submit_buy_attempt(f"{client_order_id}_rt")
+
+                executed_price = float(
+                    order.get("average")
+                    or order.get("price")
+                    or current_price
+                )
+                executed_amount = float(order.get("filled") or formatted_amount)
+                executed_cost = float(order.get("cost") or (executed_price * executed_amount))
+
+                receipt = {
+                    "id": str(order.get("id") or order.get("clientOrderId") or client_order_id),
+                    "clientOrderId": str(order.get("clientOrderId") or client_order_id),
+                    "symbol": sym,
+                    "side": "buy",
+                    "amount": executed_amount,
+                    "price": executed_price,
+                    "cost": executed_cost,
+                    "status": str(order.get("status", "closed")),
+                    "raw_response": order,
+                }
+                logger.info(
+                    "[ORDER FILLED] Market Buy: %s | Amount: %.4f | Price: $%.4f | Cost: $%.2f | Status: %s",
+                    sym, executed_amount, executed_price, executed_cost, receipt["status"],
+                )
+                return receipt
+
+            except Exception as e:
+                logger.critical("EXCHANGE EXECUTION ERROR on market buy for %s: %s", sym, e)
+                raise
+
+    def set_mock_ohlcv(self, df: Optional[pd.DataFrame]) -> None:
+        """Utility for unit testing: sets simulated OHLCV dataframe."""
+        self._mock_ohlcv = df.copy() if df is not None else None
 
     def set_mock_price(self, symbol: str, price: float) -> None:
         """Utility for unit testing: sets simulated market price."""

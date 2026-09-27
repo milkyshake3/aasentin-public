@@ -52,6 +52,7 @@ logs/
 *.sqlite3
 *.db
 state.json
+trade_history.json
 order_history/
 news_cache.json
 .cache/
