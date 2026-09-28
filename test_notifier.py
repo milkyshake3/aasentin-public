@@ -158,7 +158,21 @@ async def main() -> int:
     assert panic_embed["color"] == COLOR_DARK_RED, f"AI Panic embed color must be 0x992d22, got {hex(panic_embed['color'])}"
     print(" [PASSED] AI Panic-Sell Liquidation Embed: Color=0x992d22 (Dark Red), fields validated.")
 
-    # 6. Hourly Summary Embed
+    # 6. Time Decay Scratch Liquidation Embed
+    scratch_embed = test_notifier.build_liquidation_embed(
+        symbol="SOL/USDT",
+        reason="TIME_DECAY_SCRATCH",
+        entry_price=100.00,
+        exit_price=100.60,
+        pnl_pct=0.006,
+        notes="Time Decay Scratch triggered: Breakeven hurdle breached (+0.60% >= +0.50%) at candle 11. Capital recycled due to time decay.",
+    )
+    assert scratch_embed["color"] == COLOR_ORANGE, f"Scratch embed color must be Orange (0xe67e22), got {hex(scratch_embed['color'])}"
+    assert "TIME DECAY SCRATCH" in scratch_embed["title"]
+    assert "Capital recycled due to time decay" in scratch_embed["description"]
+    print(" [PASSED] Time Decay Scratch Liquidation Embed: Color=0xe67e22 (Orange/Yellow), fields validated.")
+
+    # 7. Hourly Summary Embed
     hourly_embed = test_notifier.build_hourly_summary_embed({
         "total_trades": 5,
         "wins": 3,

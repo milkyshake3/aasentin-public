@@ -94,6 +94,7 @@ def save_state(
             "atr_at_entry": float(kwargs.get("atr_at_entry") or 0.0),
             "current_stop_price": float(kwargs.get("current_stop_price") or 0.0),
             "candles_held": int(kwargs.get("candles_held") or 0),
+            "exit_phase": str(kwargs.get("exit_phase") or ("MOMENTUM" if int(kwargs.get("candles_held") or 0) <= 4 else ("STAGNATION" if int(kwargs.get("candles_held") or 0) <= 10 else "SCRATCH"))),
         }
 
     payload["active_positions"] = positions_dict
@@ -224,6 +225,7 @@ def load_state(file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
                         "atr_at_entry": data.get("atr_at_entry", 0.0),
                         "current_stop_price": data.get("current_stop_price", 0.0),
                         "candles_held": data.get("candles_held", 0),
+                        "exit_phase": data.get("exit_phase") or ("MOMENTUM" if data.get("candles_held", 0) <= 4 else ("STAGNATION" if data.get("candles_held", 0) <= 10 else "SCRATCH")),
                     }
 
             if "screener_cache" not in data:
@@ -246,6 +248,8 @@ def load_state(file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
                     data["atr_at_entry"] = first_pos["atr_at_entry"]
                 if data.get("candles_held") is None and "candles_held" in first_pos:
                     data["candles_held"] = first_pos["candles_held"]
+                if data.get("exit_phase") is None and "exit_phase" in first_pos:
+                    data["exit_phase"] = first_pos["exit_phase"]
 
             return data
     except Exception as e:

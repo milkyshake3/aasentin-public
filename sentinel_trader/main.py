@@ -947,6 +947,7 @@ class SentinelTrader:
                         pos_dict["last_known_pnl"] = pnl_pct
                         pos_dict["pnl_usd"] = pnl_usd
                         pos_dict["current_price"] = curr_p
+                        pos_dict["exit_phase"] = getattr(pos, "exit_phase", "MOMENTUM")
                     except Exception as e:
                         logger.warning("Could not fetch ticker price for %s in hourly summary: %s", sym, e)
                     active_pos[sym] = pos_dict

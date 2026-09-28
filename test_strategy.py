@@ -23,6 +23,8 @@ from sentinel_trader.config import Config
 from sentinel_trader.exchange_client import ExchangeClient
 from sentinel_trader.main import BotState, SentinelTrader
 from sentinel_trader.news_watcher import NewsArticle
+from sentinel_trader.notifier import COLOR_ORANGE, DiscordNotifier
+from sentinel_trader.risk_engine import PositionState, RiskEngine, TriggerReason
 from sentinel_trader.strategy import (
     Candidate,
     IndicatorResult,
@@ -609,3 +611,92 @@ async def test_fsm_complete_lifecycle_cycle():
     await bot._handle_cooldown()
     assert bot.state == BotState.CASH_SCANNING
     assert bot._cycle_count == 1
+
+
+# =====================================================================
+# 6. Multi-Stage Holding Lifecycle & Dynamic Stop Tightening Tests
+# =====================================================================
+
+def test_trailing_stop_tightening_candle_5():
+    """Verify Chandelier stop multiplier ratchets inward from 2.0*ATR to 1.25*ATR at candle 5."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    assert pos.candles_held == 0
+    assert pos.exit_phase == "MOMENTUM"
+    # Initial stop = 100.0 - 2.0 * 1.5 = 97.0
+    assert pos.current_stop_price == 97.0
+
+    # Candles 1 to 4: trail_target = 100 - (2.0 * 2.0) = 96.0; current_stop_price stays 97.0
+    for c in range(1, 5):
+        pos.candles_held = c
+        assert pos.exit_phase == "MOMENTUM"
+        trig = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+        assert trig is None
+        assert pos.current_stop_price == 97.0
+
+    # Candle 5: Phase B Stagnation
+    # trail_target = 100 - (2.0 * 1.25) = 97.5; current_stop_price ratchets to 97.5
+    pos.candles_held = 5
+    assert pos.exit_phase == "STAGNATION"
+    trig = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+    assert trig is None
+    assert pos.current_stop_price == 97.5
+
+
+def test_time_decay_scratch_triggers_at_candle_11_above_hurdle():
+    """Verify TIME_DECAY_SCRATCH triggers at candle 11 when PnL is +0.6% (+0.006 >= +0.005)."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    pos.candles_held = 11
+    assert pos.exit_phase == "SCRATCH"
+
+    trigger = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+    assert trigger == TriggerReason.TIME_DECAY_SCRATCH
+
+
+def test_no_premature_scratch_during_candles_1_to_10():
+    """Verify no premature scratch occurs during Candles 1 to 10 if price is above entry (+0.6%)."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+
+    # Candles 1 to 10 with +0.6% gain
+    for c in range(1, 11):
+        pos.candles_held = c
+        trig = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+        assert trig is None, f"Premature scratch at candle {c}"
+        if c <= 4:
+            assert pos.exit_phase == "MOMENTUM"
+        else:
+            assert pos.exit_phase == "STAGNATION"
+
+    # Candle 11 triggers TIME_DECAY_SCRATCH
+    pos.candles_held = 11
+    assert pos.exit_phase == "SCRATCH"
+    trig11 = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+    assert trig11 == TriggerReason.TIME_DECAY_SCRATCH
+
+
+def test_discord_embed_formatting_for_time_decay_scratch():
+    """Verify TIME_DECAY_SCRATCH formats Discord embed with Orange/Yellow color and capital recycled text."""
+    notifier = DiscordNotifier()
+    embed = notifier.build_liquidation_embed(
+        symbol="SOL/USDT",
+        reason="TIME_DECAY_SCRATCH",
+        entry_price=100.0,
+        exit_price=100.6,
+        pnl_pct=0.006,
+        notes="Time Decay Scratch triggered on SOL/USDT: Breakeven hurdle breached (+0.60% >= +0.50%) at candle 11. Capital recycled due to time decay.",
+    )
+    assert embed["color"] == COLOR_ORANGE
+    assert "TIME DECAY SCRATCH" in embed["title"]
+    assert "Capital recycled due to time decay" in embed["description"]
+

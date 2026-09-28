@@ -56,6 +56,7 @@ class TriggerReason(str, Enum):
     CHANDELIER_STOP = "CHANDELIER_STOP"
     FAIR_VALUE_REVERSION = "FAIR_VALUE_REVERSION"
     ALPHA_DECAY_TIME_STOP = "ALPHA_DECAY_TIME_STOP"
+    TIME_DECAY_SCRATCH = "TIME_DECAY_SCRATCH"
 
 
 class PositionState(BaseModel):
@@ -72,6 +73,16 @@ class PositionState(BaseModel):
     atr_at_entry: float = 0.0
     current_stop_price: float = 0.0
     candles_held: int = 0
+
+    @property
+    def exit_phase(self) -> str:
+        """Holding lifecycle phase based on candles_held."""
+        if self.candles_held <= 4:
+            return "MOMENTUM"
+        elif self.candles_held <= 10:
+            return "STAGNATION"
+        else:
+            return "SCRATCH"
 
     def model_post_init(self, __context: Any) -> None:
         """Initialize highest_price and current_stop_price defaults if unpopulated."""
@@ -97,6 +108,7 @@ class PositionState(BaseModel):
             "atr_at_entry": self.atr_at_entry,
             "current_stop_price": self.current_stop_price,
             "candles_held": self.candles_held,
+            "exit_phase": self.exit_phase,
         }
 
     def __getitem__(self, item: str) -> Any:
@@ -115,6 +127,8 @@ class PositionStatus(BaseModel):
     position_value_usd: float
     is_liquidated: bool = False
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    candles_held: int = 0
+    exit_phase: str = "MOMENTUM"
 
 
 class LiquidationRecord(BaseModel):
@@ -563,18 +577,18 @@ class RiskEngine:
         """Check if quantitative or hard mathematical boundaries are breached.
 
         100% deterministic evaluation implementing institutional quant mechanics:
-        1. Dynamic Trailing Stop (Chandelier Exit):
-           - highest_price = max(highest_price, current_price)
-           - trail_target = highest_price - (atr_at_entry * 2.0)
-           - current_stop_price = max(current_stop_price, trail_target)
-           - If current_price <= current_stop_price: Trigger liquidation (CHANDELIER_STOP).
-        2. Statistical Fair-Value Target (Mean Reversion Resolution):
-           - If current_price >= ema20 AND rsi >= 58.0 AND unrealized_pnl > 0:
-             Trigger liquidation (FAIR_VALUE_REVERSION).
-        3. Alpha Decay Time Stop:
-           - If candles_held >= MAX_HOLDING_CANDLES:
-             Trigger liquidation (ALPHA_DECAY_TIME_STOP).
-        4. Hard Take-Profit & Stop-Loss Boundaries (Safety ceilings & fallbacks).
+        - Phase A: Fresh Momentum (Candles 1 to 4 / 0 to 60 mins):
+          * Standard quant targets.
+          * Chandelier Stop trails at highest_price - (atr_at_entry * 2.0).
+          * Fair-Value Exit requires full convergence: price >= ema20, rsi >= 58.0, and unrealized_pnl > 0.
+        - Phase B: Momentum Stagnation (Candles 5 to 10 / 1 to 2.5 hours):
+          * Tighten trailing distance: Chandelier Stop ratchets inward to highest_price - (atr_at_entry * 1.25).
+          * Lower Fair-Value RSI hurdle: exit if price >= ema20 and rsi >= 52.0 (take modest bounce).
+        - Phase C: Capital Scratch / Decay (Candles 11 to 15 / 2.75 to 3.75 hours):
+          * Breakeven Hurdle: If unrealized_pnl >= +0.005 (+0.5%), liquidate immediately with reason="TIME_DECAY_SCRATCH".
+          * Ratchet Stop to Breakeven: current_stop_price = max(current_stop_price, entry_price * 1.001).
+        - Phase D: Hard Alpha Decay (Candle 16+ / 4+ hours):
+          * Retain mandatory exit: reason="ALPHA_DECAY_TIME_STOP".
         """
         sym = symbol or self.config.target_symbol
         pos = self.positions.get(sym)
@@ -588,41 +602,81 @@ class RiskEngine:
         if pos:
             pos.last_known_pnl = pnl_pct
 
-        # 1. Dynamic Trailing Stop (Chandelier Exit)
+        candles = pos.candles_held if pos else 0
+
+        # 1. Multi-Stage Holding Lifecycle: Chandelier Trailing Stop & Ratchet
         if pos:
             # Update peak price on each price tick
             pos.highest_price = max(pos.highest_price, current_price)
 
+            # Determine ATR trailing multiplier based on holding phase:
+            # Phase A (Candles <= 4 / 0 to 60 mins): trail at atr * 2.0
+            # Phase B & C (Candles >= 5 / 1+ hours): trail tightened inward to atr * 1.25
+            atr_mult = 2.0 if candles <= 4 else 1.25
+
             if pos.atr_at_entry > 0:
-                trail_target = round(pos.highest_price - (pos.atr_at_entry * 2.0), 4)
+                trail_target = round(pos.highest_price - (pos.atr_at_entry * atr_mult), 4)
                 # Ratchet: current_stop_price only ratchets UP, never down
                 pos.current_stop_price = max(pos.current_stop_price, trail_target)
 
+            # Phase C: Capital Scratch / Decay (Candles 11 to 15 / 2.75 to 3.75 hours)
+            # Ratchet Stop to Breakeven: current_stop_price = max(current_stop_price, entry_price * 1.001)
+            if candles >= 11:
+                breakeven_stop = round(pos.entry_price * 1.001, 4)
+                pos.current_stop_price = max(pos.current_stop_price, breakeven_stop)
+
+            if pos.atr_at_entry > 0 or candles >= 11:
                 if current_price <= pos.current_stop_price:
                     logger.warning(
-                        "[CHANDELIER STOP BREACHED] %s: Price $%.4f <= Stop $%.4f | Highest: $%.4f | ATR: %.4f",
+                        "[CHANDELIER STOP BREACHED] %s: Price $%.4f <= Stop $%.4f | Highest: $%.4f | ATR: %.4f | Phase: %s",
                         sym,
                         current_price,
                         pos.current_stop_price,
                         pos.highest_price,
                         pos.atr_at_entry,
+                        pos.exit_phase,
                     )
                     return TriggerReason.CHANDELIER_STOP
 
-        # 2. Statistical Fair-Value Target (Mean Reversion Resolution)
-        if ema20 is not None and rsi is not None:
-            if current_price >= ema20 and rsi >= 58.0 and (current_price > basis or unrealized_pnl_usd > 0):
+        # 2. Hard Take-Profit limit (ceiling)
+        if pnl_pct >= self.config.take_profit_pct:
+            logger.warning(
+                "[TAKE-PROFIT BREACHED] %s PnL %+.2f%% exceeds target limit +%.2f%%",
+                sym,
+                pnl_pct * 100,
+                self.config.take_profit_pct * 100,
+            )
+            return TriggerReason.TAKE_PROFIT
+
+        # 3. Phase C Breakeven Hurdle: Capital Scratch / Decay (Candles 11 to 15 / 2.75 to 3.75 hours)
+        # If unrealized_pnl >= +0.005 (+0.5%), liquidate immediately with reason="TIME_DECAY_SCRATCH"
+        if pos and 11 <= candles <= 15:
+            if pnl_pct >= 0.005:
                 logger.info(
-                    "[FAIR VALUE REVERSION] %s: Price $%.4f >= EMA20 $%.4f | RSI %.2f >= 58.0 | PnL: %+.2f%%",
+                    "[TIME DECAY SCRATCH] %s: Breakeven hurdle breached (PnL %+.2f%% >= +0.50%%) at candle %d. Liquidating.",
+                    sym,
+                    pnl_pct * 100,
+                    candles,
+                )
+                return TriggerReason.TIME_DECAY_SCRATCH
+
+        # 4. Statistical Fair-Value Target (Mean Reversion Resolution)
+        if ema20 is not None and rsi is not None:
+            # Phase A: RSI hurdle 58.0; Phase B+: Lowered to 52.0 (modest bounce)
+            rsi_hurdle = 52.0 if candles >= 5 else 58.0
+            if current_price >= ema20 and rsi >= rsi_hurdle and (current_price > basis or unrealized_pnl_usd > 0):
+                logger.info(
+                    "[FAIR VALUE REVERSION] %s: Price $%.4f >= EMA20 $%.4f | RSI %.2f >= %.1f | PnL: %+.2f%%",
                     sym,
                     current_price,
                     ema20,
                     rsi,
+                    rsi_hurdle,
                     pnl_pct * 100,
                 )
                 return TriggerReason.FAIR_VALUE_REVERSION
 
-        # 3. Alpha Decay Time Stop
+        # 5. Alpha Decay Time Stop (Phase D: Candle 16+ / 4+ hours)
         if pos:
             max_candles = getattr(self.config, "max_holding_candles", 16)
             if pos.candles_held >= max_candles:
@@ -634,17 +688,7 @@ class RiskEngine:
                 )
                 return TriggerReason.ALPHA_DECAY_TIME_STOP
 
-        # 4. Hard Take-Profit limit (ceiling)
-        if pnl_pct >= self.config.take_profit_pct:
-            logger.warning(
-                "[TAKE-PROFIT BREACHED] %s PnL %+.2f%% exceeds target limit +%.2f%%",
-                sym,
-                pnl_pct * 100,
-                self.config.take_profit_pct * 100,
-            )
-            return TriggerReason.TAKE_PROFIT
-
-        # 5. Hard Stop-Loss fallback (when atr_at_entry == 0 or fixed SL breach)
+        # 6. Hard Stop-Loss fallback (when atr_at_entry == 0 or fixed SL breach)
         if pos is None or pos.atr_at_entry <= 0:
             if pnl_pct <= -self.config.stop_loss_pct:
                 logger.warning(
@@ -731,6 +775,8 @@ class RiskEngine:
         pos = self.positions.get(sym)
         entry_p = pos.entry_price if pos else (self.entry_price or current_price)
         is_liq = pos.is_liquidated if pos else self.is_liquidated
+        candles = pos.candles_held if pos else 0
+        phase = pos.exit_phase if pos else "MOMENTUM"
 
         return PositionStatus(
             symbol=sym,
@@ -741,6 +787,8 @@ class RiskEngine:
             balance_base=balance,
             position_value_usd=position_value,
             is_liquidated=is_liq,
+            candles_held=candles,
+            exit_phase=phase,
         )
 
     async def execute_liquidation(
@@ -934,14 +982,20 @@ class RiskEngine:
             pnl_pct, _ = self.calculate_pnl(current_price, symbol=sym)
             if math_trigger == TriggerReason.CHANDELIER_STOP:
                 notes = (
-                    f"Chandelier Trailing Stop triggered on {sym}: Price ${current_price:.4f} <= "
+                    f"Chandelier Trailing Stop triggered on {sym} ({pos.exit_phase if pos else 'MOMENTUM'}): Price ${current_price:.4f} <= "
                     f"Stop ${pos.current_stop_price if pos else 0.0:.4f} "
                     f"(Peak ${pos.highest_price if pos else 0.0:.4f}, ATR {pos.atr_at_entry if pos else 0.0:.4f})"
                 )
             elif math_trigger == TriggerReason.FAIR_VALUE_REVERSION:
+                rsi_target = 52.0 if (pos and pos.candles_held >= 5) else 58.0
                 notes = (
-                    f"Statistical Fair-Value Target reached on {sym}: Price ${current_price:.4f} >= EMA20 "
-                    f"${ema20:.4f if ema20 else 0.0:.4f}, RSI {rsi:.1f if rsi else 0.0:.1f} >= 58.0"
+                    f"Statistical Fair-Value Target reached on {sym} ({pos.exit_phase if pos else 'MOMENTUM'}): Price ${current_price:.4f} >= EMA20 "
+                    f"${ema20:.4f if ema20 else 0.0:.4f}, RSI {rsi:.1f if rsi else 0.0:.1f} >= {rsi_target:.1f}"
+                )
+            elif math_trigger == TriggerReason.TIME_DECAY_SCRATCH:
+                notes = (
+                    f"Time Decay Scratch triggered on {sym}: Breakeven hurdle breached (+{pnl_pct * 100:.2f}% >= +0.50%) "
+                    f"at candle {pos.candles_held if pos else 0}. Capital recycled due to time decay."
                 )
             elif math_trigger == TriggerReason.ALPHA_DECAY_TIME_STOP:
                 notes = (

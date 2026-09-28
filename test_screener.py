@@ -643,14 +643,14 @@ def test_alpha_decay_time_stop_triggers_at_candle_16():
         risk.increment_all_candles()
         assert pos.candles_held == c
         # Price hovers around entry (no stop breach)
-        trigger = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+        trigger = risk.evaluate_mathematical_limits(100.2, symbol="SOL/USDT")
         assert trigger is None, f"Premature trigger at candle {c}"
 
     # Increment to candle 16 (MAX_HOLDING_CANDLES threshold reached)
     risk.increment_all_candles()
     assert pos.candles_held == 16
 
-    trigger16 = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+    trigger16 = risk.evaluate_mathematical_limits(100.2, symbol="SOL/USDT")
     assert trigger16 == TriggerReason.ALPHA_DECAY_TIME_STOP
 
 
@@ -1037,6 +1037,118 @@ async def test_risk_engine_record_trade_score_integration(tmp_path):
     scores2 = load_asset_scores(scores_file)
     assert scores2["SOL/USDT"]["score"] == 0.8
     assert scores2["SOL/USDT"]["trades_count"] == 2
+
+
+def test_trailing_stop_tightening_at_candle_5():
+    """Verify Chandelier stop multiplier tightens from 2.0*ATR (Phase A) to 1.25*ATR (Phase B) at candle 5."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    # Entry stop was 100.0 - (2.0 * 1.5) = 97.0
+    assert pos.candles_held == 0
+    assert pos.exit_phase == "MOMENTUM"
+
+    # Candle 1 to 4: trailing stop at highest_price - 2.0 * atr = 100 - 4.0 = 96.0 (stop stays 97.0)
+    for c in range(1, 5):
+        risk.increment_all_candles()
+        assert pos.candles_held == c
+        assert pos.exit_phase == "MOMENTUM"
+        risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+        assert pos.current_stop_price == 97.0
+
+    # Candle 5: Momentum Stagnation (Phase B)
+    # Trailing distance ratchets inward to highest_price - (atr_at_entry * 1.25)
+    # 100.0 - (2.0 * 1.25) = 100.0 - 2.5 = 97.5
+    # Stop ratchets up from 97.0 to 97.5
+    risk.increment_all_candles()
+    assert pos.candles_held == 5
+    assert pos.exit_phase == "STAGNATION"
+    trigger = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+    assert trigger is None
+    assert pos.current_stop_price == 97.5
+
+
+def test_time_decay_scratch_triggers_at_candle_11():
+    """Verify TIME_DECAY_SCRATCH triggers at candle 11 when PnL is +0.6% (+0.006 >= +0.005 hurdle)."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    pos.candles_held = 11
+    assert pos.exit_phase == "SCRATCH"
+
+    # Price = 100.60 -> PnL = +0.6% (+0.006 >= +0.005 hurdle)
+    trigger = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+    assert trigger == TriggerReason.TIME_DECAY_SCRATCH
+
+
+def test_no_premature_scratch_candles_1_to_10_when_price_above_entry():
+    """Verify no premature scratch occurs during Candles 1 to 10 if price is above entry (+0.6%)."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+
+    # For candles 1 to 10, with price at $100.60 (+0.6% PnL)
+    for c in range(1, 11):
+        pos.candles_held = c
+        trigger = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+        assert trigger is None, f"Premature scratch triggered at candle {c}"
+        if c <= 4:
+            assert pos.exit_phase == "MOMENTUM"
+        else:
+            assert pos.exit_phase == "STAGNATION"
+
+    # At candle 11, it MUST trigger TIME_DECAY_SCRATCH
+    pos.candles_held = 11
+    assert pos.exit_phase == "SCRATCH"
+    trigger11 = risk.evaluate_mathematical_limits(100.60, symbol="SOL/USDT")
+    assert trigger11 == TriggerReason.TIME_DECAY_SCRATCH
+
+
+def test_phase_c_breakeven_stop_ratchet():
+    """Verify Phase C ratchets stop price to entry_price * 1.001."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    pos.candles_held = 11
+    assert pos.exit_phase == "SCRATCH"
+
+    # Price = 100.30 (+0.3% < +0.5% hurdle, so no scratch)
+    trigger = risk.evaluate_mathematical_limits(100.30, symbol="SOL/USDT")
+    assert trigger is None
+    # Stop should be ratcheted to at least entry_price * 1.001 = 100.10
+    assert pos.current_stop_price >= 100.10
+
+    # If price drops to 100.05 (<= 100.10), Chandelier stop triggers at breakeven
+    trigger_stop = risk.evaluate_mathematical_limits(100.05, symbol="SOL/USDT")
+    assert trigger_stop == TriggerReason.CHANDELIER_STOP
+
+
+def test_phase_b_fair_value_rsi_hurdle_lowered_to_52():
+    """Verify Phase B allows modest bounce exit with RSI >= 52.0 (Phase A requires RSI >= 58.0)."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+
+    # Candle 3 (Phase A): price 102.0 > ema20 101.0, rsi 54.0 (< 58.0) -> No trigger
+    pos.candles_held = 3
+    trig_a = risk.evaluate_mathematical_limits(102.0, symbol="SOL/USDT", ema20=101.0, rsi=54.0)
+    assert trig_a is None
+
+    # Candle 6 (Phase B): price 102.0 > ema20 101.0, rsi 54.0 (>= 52.0) -> Triggers FAIR_VALUE_REVERSION
+    pos.candles_held = 6
+    trig_b = risk.evaluate_mathematical_limits(102.0, symbol="SOL/USDT", ema20=101.0, rsi=54.0)
+    assert trig_b == TriggerReason.FAIR_VALUE_REVERSION
+
 
 
 

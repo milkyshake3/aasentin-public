@@ -20,7 +20,8 @@ logger = logging.getLogger("sentinel.notifier")
 COLOR_GREEN = 0x2ECC71      # Take-Profit (Success / Gains)
 COLOR_RED = 0xE74C3C        # Stop-Loss (Standard Protection)
 COLOR_DARK_RED = 0x992D22   # AI Panic-Sell (Catastrophic Threat)
-COLOR_ORANGE = 0xE67E22     # Threat Detected (Warning)
+COLOR_ORANGE = 0xE67E22     # Threat Detected / Time Decay Scratch (Warning / Capital Recycled)
+COLOR_YELLOW = 0xF1C40F     # Orange/Yellow indicator
 COLOR_BLUE = 0x3498DB       # System Startup (Informational)
 COLOR_GRAY = 0x95A5A6       # Hourly Summary (Neutral / Flat / 0 Trades)
 
@@ -67,12 +68,19 @@ class DiscordNotifier:
         if "TAKE_PROFIT" in reason_upper:
             color = COLOR_GREEN
             title = f"💰 [TAKE PROFIT] Position Liquidated: {symbol}"
+            description = f"Spot position in **{symbol}** has been liquidated into USDT."
         elif "AI_PANIC" in reason_upper:
             color = COLOR_DARK_RED
             title = f"🚨 [AI PANIC SELL] Emergency Liquidation: {symbol}"
+            description = f"Spot position in **{symbol}** has been liquidated into USDT."
+        elif "TIME_DECAY_SCRATCH" in reason_upper or "SCRATCH" in reason_upper:
+            color = COLOR_ORANGE  # Orange/Yellow indicator (0xE67E22)
+            title = f"⏳ [TIME DECAY SCRATCH] Capital Recycled: {symbol}"
+            description = f"Capital recycled due to time decay. Spot position in **{symbol}** has been liquidated into USDT."
         else:
             color = COLOR_RED
             title = f"🛑 [STOP LOSS] Position Liquidated: {symbol}"
+            description = f"Spot position in **{symbol}** has been liquidated into USDT."
 
         pnl_sign = "+" if pnl_pct >= 0 else ""
         fields: List[Dict[str, Any]] = [
@@ -85,7 +93,7 @@ class DiscordNotifier:
 
         return {
             "title": title,
-            "description": f"Spot position in **{symbol}** has been liquidated into USDT.",
+            "description": description,
             "color": color,
             "fields": fields,
             "footer": {"text": "Sentinel-Trader • Autonomous Risk Mitigation Bot"},
@@ -234,7 +242,15 @@ class DiscordNotifier:
                 # Format percentage: if |pnl_num| <= 1.0 and non-zero, treat as decimal
                 pct_val = pnl_num * 100.0 if abs(pnl_num) <= 1.0 and pnl_num != 0.0 else pnl_num
                 sign_sym = "+" if pct_val >= 0 else ""
-                bullets.append(f"• **{sym}**: {sign_sym}{pct_val:.2f}%")
+
+                phase_val = None
+                if hasattr(pos_data, "exit_phase") and getattr(pos_data, "exit_phase"):
+                    phase_val = getattr(pos_data, "exit_phase")
+                elif isinstance(pos_data, dict) and pos_data.get("exit_phase"):
+                    phase_val = pos_data["exit_phase"]
+
+                phase_str = f" [{phase_val}]" if phase_val else ""
+                bullets.append(f"• **{sym}**{phase_str}: {sign_sym}{pct_val:.2f}%")
             value_slots = "\n".join(bullets) if bullets else "100% Cash"
 
         fields = [
