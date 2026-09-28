@@ -521,3 +521,245 @@ async def test_screener_usd_base_regex_whitelist():
     assert "BTC/USDT" in universe
     assert universe == ["WHITELISTEDUSD/USDT", "BTC/USDT"]
 
+
+# =====================================================================
+# 10. Institutional Quant Mechanics Tests
+# =====================================================================
+
+def test_chandelier_stop_ratchet_up_never_down():
+    """Verify Chandelier Trailing Stop only ratchets UP, never downward on price dips."""
+    # Use higher take_profit_pct so chandelier trailing stop dynamics can be tested without fixed TP early-exit
+    config = Config(mock_exchange=True, atr_sl_multiplier=1.5, take_profit_pct=0.20)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    # Entry at $100 with ATR = 2.0
+    # Initial stop = 100 - (2.0 * 1.5) = 97.0
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    assert pos.highest_price == 100.0
+    assert pos.current_stop_price == 97.0
+    assert pos.atr_at_entry == 2.0
+
+    # Tick 1: Price rises to $105.0
+    # highest_price -> 105.0
+    # trail_target = 105.0 - (2.0 * 2.0) = 101.0
+    # current_stop_price = max(97.0, 101.0) -> 101.0 (ratchets UP)
+    trigger1 = risk.evaluate_mathematical_limits(105.0, symbol="SOL/USDT")
+    assert trigger1 is None
+    assert pos.highest_price == 105.0
+    assert pos.current_stop_price == 101.0
+
+    # Tick 2: Price pulls back to $103.0
+    # highest_price stays 105.0
+    # trail_target = 105.0 - 4.0 = 101.0
+    # current_stop_price must STAY 101.0 (CANNOT DECREASE)
+    trigger2 = risk.evaluate_mathematical_limits(103.0, symbol="SOL/USDT")
+    assert trigger2 is None
+    assert pos.highest_price == 105.0
+    assert pos.current_stop_price == 101.0
+
+    # Tick 3: Price pushes higher to $110.0
+    # highest_price -> 110.0
+    # trail_target = 110.0 - 4.0 = 106.0
+    # current_stop_price = max(101.0, 106.0) -> 106.0 (ratchets UP again)
+    trigger3 = risk.evaluate_mathematical_limits(110.0, symbol="SOL/USDT")
+    assert trigger3 is None
+    assert pos.highest_price == 110.0
+    assert pos.current_stop_price == 106.0
+
+    # Tick 4: Price dips to $107.0 (above stop $106.0) -> No breach, stop stays $106.0
+    trigger4 = risk.evaluate_mathematical_limits(107.0, symbol="SOL/USDT")
+    assert trigger4 is None
+    assert pos.current_stop_price == 106.0
+
+    # Tick 5: Price dumps to $105.5 (<= current_stop_price $106.0) -> Triggers CHANDELIER_STOP
+    trigger5 = risk.evaluate_mathematical_limits(105.5, symbol="SOL/USDT")
+    assert trigger5 == TriggerReason.CHANDELIER_STOP
+
+
+def test_volatility_parity_sizing_high_vs_low_atr():
+    """Verify Volatility Parity sizing: high ATR generates strictly smaller sizing than low ATR."""
+    config = Config(
+        mock_exchange=True,
+        portfolio_risk_per_trade_pct=0.01,  # 1% equity risk
+        atr_sl_multiplier=1.5,
+    )
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    free_usdt = 10000.0
+    total_equity = 10000.0
+    entry_price = 100.0
+
+    # High volatility asset: ATR = 5.0
+    # stop_dist = 5.0 * 1.5 = 7.5
+    # dollar_risk = 10000 * 0.01 = 100.0
+    # target_qty = 100.0 / 7.5 = 13.3333
+    # notional = 13.3333 * 100 = 1333.33
+    cost_high_atr = risk.calculate_slot_size(
+        free_usdt=free_usdt,
+        atr=5.0,
+        entry_price=entry_price,
+        total_equity=total_equity,
+    )
+
+    # Low volatility asset: ATR = 1.0
+    # stop_dist = 1.0 * 1.5 = 1.5
+    # dollar_risk = 100.0
+    # target_qty = 100.0 / 1.5 = 66.6667
+    # notional = 66.6667 * 100 = 6666.67 -> capped at 33% of free USDT = 3300.0
+    cost_low_atr = risk.calculate_slot_size(
+        free_usdt=free_usdt,
+        atr=1.0,
+        entry_price=entry_price,
+        total_equity=total_equity,
+    )
+
+    assert cost_high_atr == pytest.approx(1333.33, abs=0.5)
+    assert cost_low_atr == pytest.approx(3300.0, abs=0.5)
+    assert cost_high_atr < cost_low_atr
+
+    # Verify ExchangeClient implementation matches
+    ec_cost_high = exchange.calculate_volatility_parity_sizing(
+        total_equity=total_equity,
+        free_usdt=free_usdt,
+        entry_price=entry_price,
+        atr=5.0,
+    )
+    assert ec_cost_high == pytest.approx(cost_high_atr, abs=1e-4)
+
+
+def test_alpha_decay_time_stop_triggers_at_candle_16():
+    """Verify Alpha Decay time stop triggers liquidation when position is held for 16 candles."""
+    config = Config(mock_exchange=True, max_holding_candles=16)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    pos = risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    assert pos.candles_held == 0
+
+    # Simulate candle increments up to 15 candles
+    for c in range(1, 16):
+        risk.increment_all_candles()
+        assert pos.candles_held == c
+        # Price hovers around entry (no stop breach)
+        trigger = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+        assert trigger is None, f"Premature trigger at candle {c}"
+
+    # Increment to candle 16 (MAX_HOLDING_CANDLES threshold reached)
+    risk.increment_all_candles()
+    assert pos.candles_held == 16
+
+    trigger16 = risk.evaluate_mathematical_limits(100.0, symbol="SOL/USDT")
+    assert trigger16 == TriggerReason.ALPHA_DECAY_TIME_STOP
+
+
+def test_statistical_fair_value_target_mean_reversion():
+    """Verify Statistical Fair-Value Target triggers when Price >= EMA(20) AND RSI >= 58.0 AND PnL > 0."""
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange)
+
+    risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+
+    # Case 1: In profit (Price $103 > $100), above EMA20 ($102), RSI 60.0 (>= 58.0) -> Trigger
+    trig1 = risk.evaluate_mathematical_limits(
+        current_price=103.0,
+        symbol="SOL/USDT",
+        ema20=102.0,
+        rsi=60.0,
+    )
+    assert trig1 == TriggerReason.FAIR_VALUE_REVERSION
+
+    # Case 2: Above EMA20 and in profit, but RSI is only 52.0 (< 58.0) -> No trigger
+    trig2 = risk.evaluate_mathematical_limits(
+        current_price=103.0,
+        symbol="SOL/USDT",
+        ema20=102.0,
+        rsi=52.0,
+    )
+    assert trig2 is None
+
+    # Case 3: Fresh position (entry 100, stop 97). Price 98.5 is above stop ($97.0) and above EMA20 ($97.0),
+    # RSI >= 58.0, but unrealized PnL is negative ($98.5 < $100.0) -> No trigger
+    risk.open_position("ETH/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    trig3 = risk.evaluate_mathematical_limits(
+        current_price=98.5,
+        symbol="ETH/USDT",
+        ema20=97.0,
+        rsi=62.0,
+    )
+    assert trig3 is None
+
+
+def test_state_store_quant_telemetry_serialization(tmp_path):
+    """Verify state.json serializes and deserializes quant fields across restarts."""
+    state_file = str(tmp_path / "quant_state.json")
+
+    positions = {
+        "SOL/USDT": {
+            "entry_price": 150.0,
+            "amount": 10.0,
+            "order_id": "ord_sol_1",
+            "highest_price": 162.5,
+            "atr_at_entry": 3.4,
+            "current_stop_price": 155.7,
+            "candles_held": 8,
+        },
+    }
+
+    save_state(
+        state=BotState.IN_POSITION,
+        active_positions=positions,
+        file_path=state_file,
+    )
+
+    loaded = load_state(state_file)
+    assert loaded is not None
+    sol = loaded["active_positions"]["SOL/USDT"]
+    assert sol["highest_price"] == 162.5
+    assert sol["atr_at_entry"] == 3.4
+    assert sol["current_stop_price"] == 155.7
+    assert sol["candles_held"] == 8
+
+
+@pytest.mark.asyncio
+async def test_quant_liquidation_records_in_trade_history(tmp_path):
+    """Verify quantitative liquidation triggers are recorded in trade_history.json."""
+    from sentinel_trader.analytics import load_trades
+
+    trade_file = str(tmp_path / "trade_history_test.json")
+    config = Config(mock_exchange=True, max_holding_candles=16)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(config, exchange, trade_history_file=trade_file)
+
+    # 1. Chandelier Stop liquidation
+    risk.open_position("SOL/USDT", entry_price=100.0, amount=5.0, atr=2.0)
+    exchange.set_mock_balance("SOL", 5.0)
+    exchange.set_mock_price("SOL/USDT", 95.0)
+    rec1 = await risk.execute_liquidation(TriggerReason.CHANDELIER_STOP, notes="Chandelier test", symbol="SOL/USDT")
+    assert rec1.trigger == TriggerReason.CHANDELIER_STOP
+
+    # 2. Fair-Value Reversion liquidation
+    risk.open_position("ETH/USDT", entry_price=2500.0, amount=1.0, atr=50.0)
+    exchange.set_mock_balance("ETH", 1.0)
+    exchange.set_mock_price("ETH/USDT", 2580.0)
+    rec2 = await risk.execute_liquidation(TriggerReason.FAIR_VALUE_REVERSION, notes="Fair value test", symbol="ETH/USDT")
+    assert rec2.trigger == TriggerReason.FAIR_VALUE_REVERSION
+
+    # 3. Alpha Decay Time Stop liquidation
+    risk.open_position("BTC/USDT", entry_price=60000.0, amount=0.1, atr=1000.0)
+    exchange.set_mock_balance("BTC", 0.1)
+    exchange.set_mock_price("BTC/USDT", 60100.0)
+    rec3 = await risk.execute_liquidation(TriggerReason.ALPHA_DECAY_TIME_STOP, notes="Alpha decay test", symbol="BTC/USDT")
+    assert rec3.trigger == TriggerReason.ALPHA_DECAY_TIME_STOP
+
+    # Verify trade_history records
+    trades = load_trades(trade_file)
+    assert len(trades) == 3
+    reasons = [t["trigger_reason"] for t in trades]
+    assert "CHANDELIER_STOP" in reasons
+    assert "FAIR_VALUE_REVERSION" in reasons
+    assert "ALPHA_DECAY_TIME_STOP" in reasons
+
+

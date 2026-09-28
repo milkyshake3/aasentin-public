@@ -24,7 +24,9 @@ from sentinel_trader.exchange_client import ExchangeClient
 from sentinel_trader.main import BotState, SentinelTrader
 from sentinel_trader.news_watcher import NewsArticle
 from sentinel_trader.strategy import (
+    Candidate,
     IndicatorResult,
+    calculate_atr,
     calculate_ema,
     calculate_indicators,
     calculate_rsi,
@@ -151,15 +153,91 @@ def test_indicator_result_container_semantics():
     assert "ema" in df.columns
     assert "rsi14" in df.columns
     assert "ema200" in df.columns
+    assert "atr" in df.columns
+    assert "atr14" in df.columns
+    assert "ema20" in df.columns
 
     # 3. Object attribute and item access
     res = calculate_indicators(df)
     assert isinstance(res, IndicatorResult)
     assert res.rsi is not None
     assert res.ema is not None
+    assert res.atr is not None
+    assert res.atr14 is not None
+    assert res.ema20 is not None
     pd.testing.assert_series_equal(res["rsi"], rsi)
     pd.testing.assert_series_equal(res["ema"], ema)
+    pd.testing.assert_series_equal(res["atr"], res.atr)
+    pd.testing.assert_series_equal(res["atr14"], res.atr)
+    pd.testing.assert_series_equal(res["ema20"], res.ema20)
     pd.testing.assert_series_equal(res["close"], df["close"])
+
+
+def test_atr_calculation_constant_tr():
+    """Verify ATR(14) converges exactly to constant True Range."""
+    n = 50
+    # High-Low is constantly 2.0, close is constantly in the middle
+    df = pd.DataFrame({
+        "high": [102.0] * n,
+        "low": [100.0] * n,
+        "close": [101.0] * n,
+    })
+    atr = calculate_atr(df, period=14)
+    assert len(atr) == n
+    # Since TR is 2.0 at every single candle, Wilder's EMA must be exactly 2.0
+    assert np.allclose(atr.values, 2.0, atol=1e-8)
+
+
+def test_atr_calculation_accuracy_against_control_series():
+    """Verify ATR(14) numerical accuracy against a strictly calculated control series."""
+    # 20 candles of realistic price data with varying highs, lows, and gaps
+    highs = [
+        105.0, 107.0, 106.5, 108.0, 110.0,
+        109.5, 111.0, 112.5, 111.0, 113.0,
+        115.0, 114.0, 116.0, 117.5, 119.0,
+        118.0, 120.0, 121.5, 120.0, 122.0,
+    ]
+    lows = [
+        101.0, 103.0, 102.0, 104.0, 106.0,
+        105.0, 107.0, 108.0, 107.5, 109.0,
+        111.0, 110.0, 112.0, 113.5, 115.0,
+        114.0, 116.0, 117.0, 116.5, 118.0,
+    ]
+    closes = [
+        103.0, 106.0, 104.0, 107.5, 108.0,
+        107.0, 110.0, 110.5, 108.5, 112.0,
+        113.0, 111.5, 115.0, 116.0, 117.0,
+        115.5, 119.0, 119.5, 118.0, 121.0,
+    ]
+
+    df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+    # Compute control series step-by-step using Wilder's exact formula
+    tr_control = []
+    for i in range(len(highs)):
+        h = highs[i]
+        l = lows[i]
+        if i == 0:
+            tr = h - l
+        else:
+            prev_c = closes[i - 1]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        tr_control.append(tr)
+
+    period = 14
+    alpha = 1.0 / period
+    atr_control = []
+    curr_atr = tr_control[0]
+    atr_control.append(curr_atr)
+    for i in range(1, len(tr_control)):
+        curr_atr = (1.0 - alpha) * curr_atr + alpha * tr_control[i]
+        atr_control.append(curr_atr)
+
+    calculated_atr = calculate_atr(df, period=14)
+
+    assert len(calculated_atr) == len(atr_control)
+    # Numerical accuracy check across all 20 candles
+    assert np.allclose(calculated_atr.values, atr_control, atol=1e-6)
 
 
 # =====================================================================

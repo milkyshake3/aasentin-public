@@ -413,6 +413,7 @@ class SentinelTrader:
             curr_close = self._latest_price or 150.0
             curr_rsi = 35.0
             curr_ema = 150.0
+            curr_atr = 0.0
 
             # Single-pair test override (when mock OHLCV is injected directly)
             if getattr(self.exchange, "_mock_ohlcv", None) is not None:
@@ -438,6 +439,7 @@ class SentinelTrader:
                     curr_close = float(df["close"].iloc[-2])
                     curr_rsi = float(df["rsi"].iloc[-2]) if "rsi" in df and not pd.isna(df["rsi"].iloc[-2]) else 35.0
                     curr_ema = float(df["ema"].iloc[-2]) if "ema" in df and not pd.isna(df["ema"].iloc[-2]) else 150.0
+                    curr_atr = float(df["atr14"].iloc[-2]) if "atr14" in df and not pd.isna(df["atr14"].iloc[-2]) else 0.0
             else:
                 # Multi-candidate scanning across dynamic universe
                 scan_symbols = [self.config.target_symbol] + [s for s in universe if s != self.config.target_symbol]
@@ -469,8 +471,10 @@ class SentinelTrader:
                     curr_close = best.close
                     curr_rsi = best.rsi
                     curr_ema = best.ema
+                    curr_atr = getattr(best, "atr", 0.0)
                     has_signal = True
                 else:
+                    curr_atr = 0.0
                     if self.exchange.is_mock and self.scenario == "fsm_cycle" and self._scan_tick_count >= 2:
                         df = await self.exchange.fetch_ohlcv_dataframe(self.config.target_symbol, timeframe=self.config.timeframe, limit=200)
                         if len(df) >= 200:
@@ -488,6 +492,7 @@ class SentinelTrader:
                             curr_close = float(df["close"].iloc[-2])
                             curr_rsi = float(df["rsi"].iloc[-2]) if "rsi" in df and not pd.isna(df["rsi"].iloc[-2]) else 35.0
                             curr_ema = float(df["ema"].iloc[-2]) if "ema" in df and not pd.isna(df["ema"].iloc[-2]) else 150.0
+                            curr_atr = float(df["atr14"].iloc[-2]) if "atr14" in df and not pd.isna(df["atr14"].iloc[-2]) else 0.0
 
             self._latest_price = curr_close
 
@@ -525,6 +530,8 @@ class SentinelTrader:
                     )
                 else:
                     self._latest_rsi = curr_rsi
+                    self._latest_atr = curr_atr
+                    self._pending_atr = curr_atr
                     self._pending_symbol = chosen_symbol
                     logger.info("[SIGNAL VALIDATED] Entry criteria met for %s with clear AI sentiment. Transitioning to ENTERING.", chosen_symbol)
                     self.transition_to(BotState.ENTERING)
@@ -567,9 +574,18 @@ class SentinelTrader:
         logger.info("[ENTERING] Preparing spot market buy for %s...", target_sym)
 
         try:
-            # 1. Query free quote balance and calculate slot size
+            # 1. Query free quote balance and calculate volatility parity slot size
             free_usdt = await self.exchange.get_balance(self.config.quote_asset)
-            cost_usdt = self.risk_engine.calculate_slot_size(free_usdt)
+            total_equity = await self.exchange.get_total_equity()
+            entry_est_price = await self.exchange.get_ticker_price(target_sym)
+            pending_atr = getattr(self, "_pending_atr", None) or getattr(self, "_latest_atr", None)
+
+            cost_usdt = self.risk_engine.calculate_slot_size(
+                free_usdt=free_usdt,
+                atr=pending_atr,
+                entry_price=entry_est_price,
+                total_equity=total_equity,
+            )
 
             # Minimum trade size check
             if free_usdt < 15.0 or cost_usdt < 15.0:
@@ -605,13 +621,14 @@ class SentinelTrader:
             self._client_order_id = client_order_id
             self._latest_price = entry_price
 
-            # Open slot in RiskEngine
-            self.risk_engine.open_position(
+            # Open slot in RiskEngine with institutional quant mechanics
+            pos = self.risk_engine.open_position(
                 symbol=target_sym,
                 entry_price=entry_price,
                 amount=token_amount,
                 order_id=client_order_id,
                 entry_timestamp=entry_ts,
+                atr=pending_atr,
             )
 
             # Atomically persist active positions state to disk
@@ -625,13 +642,17 @@ class SentinelTrader:
                 entry_timestamp=entry_ts,
                 client_order_id=client_order_id,
                 last_known_pnl=0.0,
+                highest_price=pos.highest_price,
+                atr_at_entry=pos.atr_at_entry,
+                current_stop_price=pos.current_stop_price,
+                candles_held=pos.candles_held,
                 file_path=self.state_file,
                 target_symbol=target_sym,
             )
 
             # 4. Calculate targets
             tp_price = round(entry_price * (1.0 + self.config.take_profit_pct), 4)
-            sl_price = round(entry_price * (1.0 - self.config.stop_loss_pct), 4)
+            sl_price = pos.current_stop_price
             rsi_val = getattr(self, "_latest_rsi", 35.0)
 
             # 5. Discord Alert: Send Blue "Position Entered" card
@@ -794,17 +815,29 @@ class SentinelTrader:
                 file_path=self.state_file,
             )
 
+            # Increment candles_held across active slots at 15m candle close boundaries
+            now_ts = time.time()
+            candle_interval_sec = 900.0
+            current_bucket = int(now_ts // candle_interval_sec)
+            if hasattr(self, "_last_candle_bucket") and self._last_candle_bucket is not None:
+                if current_bucket > self._last_candle_bucket:
+                    self.risk_engine.increment_all_candles()
+                    self._last_candle_bucket = current_bucket
+            else:
+                self._last_candle_bucket = current_bucket
+
             for sym, pos in self.risk_engine.active_positions.items():
                 p = await self.exchange.get_ticker_price(sym)
                 status = await self.risk_engine.get_position_status(p, symbol=sym)
                 tp_price = pos.entry_price * (1.0 + self.config.take_profit_pct)
-                sl_price = pos.entry_price * (1.0 - self.config.stop_loss_pct)
+                sl_price = pos.current_stop_price if pos.current_stop_price > 0 else pos.entry_price * (1.0 - self.config.stop_loss_pct)
 
                 console.print(
                     f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                     f"[bold green][IN_POSITION][/bold green] {sym}: ${p:.4f} | "
                     f"PnL: [{'bold green' if status.pnl_pct >= 0 else 'bold red'}]{status.pnl_pct * 100:+.2f}%[/] | "
-                    f"Limits: [red]SL ${sl_price:.2f}[/red] <-> [green]TP ${tp_price:.2f}[/green]"
+                    f"Limits: [red]Chandelier SL ${sl_price:.2f} (Peak ${pos.highest_price:.2f})[/red] <-> [green]TP ${tp_price:.2f}[/green] | "
+                    f"Held: {pos.candles_held} candles"
                 )
 
         except Exception as e:

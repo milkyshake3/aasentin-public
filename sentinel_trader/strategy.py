@@ -31,6 +31,8 @@ class Candidate(BaseModel):
     rsi_bounce: float = 0.0
     volume: float = 0.0
     quote_volume: float = 0.0
+    atr: float = 0.0
+    ema20: float = 0.0
 
 
 class CandidateList(list):
@@ -60,13 +62,30 @@ def format_price(val: float) -> str:
 class IndicatorResult(tuple):
     """Container returning RSI and EMA, supporting tuple unpacking, attributes, and column access."""
 
-    def __new__(cls, rsi: pd.Series, ema: pd.Series, df: Optional[pd.DataFrame] = None):
+    def __new__(
+        cls,
+        rsi: pd.Series,
+        ema: pd.Series,
+        df: Optional[pd.DataFrame] = None,
+        atr: Optional[pd.Series] = None,
+        ema20: Optional[pd.Series] = None,
+    ):
         return super().__new__(cls, (rsi, ema))
 
-    def __init__(self, rsi: pd.Series, ema: pd.Series, df: Optional[pd.DataFrame] = None):
+    def __init__(
+        self,
+        rsi: pd.Series,
+        ema: pd.Series,
+        df: Optional[pd.DataFrame] = None,
+        atr: Optional[pd.Series] = None,
+        ema20: Optional[pd.Series] = None,
+    ):
         self.rsi = rsi
         self.ema = ema
         self.df = df
+        self.atr = atr if atr is not None else (df["atr14"] if df is not None and "atr14" in df.columns else None)
+        self.atr14 = self.atr
+        self.ema20 = ema20 if ema20 is not None else (df["ema20"] if df is not None and "ema20" in df.columns else None)
 
     def __getitem__(self, item: Any) -> Any:
         if isinstance(item, str):
@@ -74,10 +93,57 @@ class IndicatorResult(tuple):
                 return self.rsi
             if item.lower() in ("ema", "ema200", "ema_200", "ema100", "ema_100"):
                 return self.ema
+            if item.lower() in ("atr", "atr14", "atr_14"):
+                return self.atr
+            if item.lower() in ("ema20", "ema_20"):
+                return self.ema20
             if self.df is not None and item in self.df.columns:
                 return self.df[item]
             raise KeyError(f"Key '{item}' not found in IndicatorResult or underlying DataFrame")
         return super().__getitem__(item)
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Average True Range (ATR) using Wilder's exponential smoothing.
+
+    Computes True Range:
+        TR = max(High - Low, abs(High - Close_prev), abs(Low - Close_prev))
+    Smooths via Wilder's EMA (alpha = 1 / period).
+
+    Args:
+        df: Pandas DataFrame containing 'high', 'low', 'close' columns (case-insensitive).
+        period: Smoothing lookback period (default: 14).
+
+    Returns:
+        pd.Series: Computed ATR values.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+
+    # Resolve close, high, low columns case-insensitively
+    close_col = next((c for c in ("close", "Close", "CLOSE") if c in df.columns), None)
+    if close_col is None:
+        raise KeyError(f"DataFrame must contain a 'close' column. Found columns: {list(df.columns)}")
+
+    high_col = next((c for c in ("high", "High", "HIGH") if c in df.columns), None)
+    low_col = next((c for c in ("low", "Low", "LOW") if c in df.columns), None)
+
+    close = pd.to_numeric(df[close_col], errors="coerce")
+    high = pd.to_numeric(df[high_col], errors="coerce") if high_col else close
+    low = pd.to_numeric(df[low_col], errors="coerce") if low_col else close
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    # pandas max(axis=1) skips NaN by default so index 0 uses tr1 (high - low)
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # Wilder's smoothing: alpha = 1 / period
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    atr.name = f"atr{period}"
+    return atr
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -137,23 +203,28 @@ def calculate_indicators(
     df: pd.DataFrame,
     rsi_period: int = 14,
     ema_period: int = 100,
+    atr_period: int = 14,
+    ema_fast_period: int = 20,
 ) -> IndicatorResult:
-    """Calculate RSI(14) and EMA for a price dataframe.
+    """Calculate RSI(14), EMA trend filter, ATR(14), and EMA(20) for a price dataframe.
 
-    Adds 'rsi', 'ema', 'rsi14', 'ema{period}', and 'ema200' columns to the dataframe in-place
-    and returns an IndicatorResult which can be unpacked as (rsi, ema) or accessed via attributes/keys.
+    Adds 'rsi', 'ema', 'rsi14', 'ema{period}', 'ema200', 'atr', 'atr14', and 'ema20'
+    columns to the dataframe in-place and returns an IndicatorResult which can be unpacked
+    as (rsi, ema) or accessed via attributes (.atr, .ema20) and dictionary keys.
 
     Args:
         df: Pandas DataFrame containing at least a 'close' (or 'Close') column.
         rsi_period: Lookback period for Wilder's RSI (default: 14).
         ema_period: Lookback period for EMA trend filter (default: 100).
+        atr_period: Lookback period for Wilder's ATR (default: 14).
+        ema_fast_period: Lookback period for short-term EMA fair-value target (default: 20).
 
     Returns:
-        IndicatorResult: Unpackable as (rsi, ema), with .rsi and .ema attributes.
+        IndicatorResult: Unpackable as (rsi, ema), with .rsi, .ema, .atr, and .ema20 attributes.
     """
     if df.empty:
         empty_series = pd.Series(dtype="float64")
-        return IndicatorResult(empty_series, empty_series, df=df)
+        return IndicatorResult(empty_series, empty_series, df=df, atr=empty_series, ema20=empty_series)
 
     # Resolve close column case-insensitively
     close_col = None
@@ -172,6 +243,8 @@ def calculate_indicators(
     # Compute indicators
     rsi_series = calculate_rsi(close_series, period=rsi_period)
     ema_series = calculate_ema(close_series, span=ema_period, min_periods=1)
+    atr_series = calculate_atr(df, period=atr_period)
+    ema20_series = calculate_ema(close_series, span=ema_fast_period, min_periods=1)
 
     # Attach to dataframe in-place
     df["rsi"] = rsi_series
@@ -183,7 +256,12 @@ def calculate_indicators(
     else:
         df["ema200"] = ema_series
 
-    return IndicatorResult(rsi_series, ema_series, df=df)
+    # Attach quantitative indicators: atr, atr14, ema20
+    df["atr"] = atr_series
+    df["atr14"] = atr_series
+    df["ema20"] = ema20_series
+
+    return IndicatorResult(rsi_series, ema_series, df=df, atr=atr_series, ema20=ema20_series)
 
 
 def check_entry_signal(
@@ -387,6 +465,16 @@ async def scan_universe_for_signals(
                     if "volume" in df.columns and not pd.isna(df["volume"].iloc[-2])
                     else 0.0
                 )
+                curr_atr = (
+                    float(df["atr14"].iloc[-2])
+                    if "atr14" in df.columns and not pd.isna(df["atr14"].iloc[-2])
+                    else 0.0
+                )
+                curr_ema20 = (
+                    float(df["ema20"].iloc[-2])
+                    if "ema20" in df.columns and not pd.isna(df["ema20"].iloc[-2])
+                    else 0.0
+                )
                 bounce = curr_rsi_f - prev_rsi_f
                 candidate = Candidate(
                     symbol=symbol,
@@ -397,6 +485,8 @@ async def scan_universe_for_signals(
                     rsi_bounce=round(bounce, 4),
                     volume=vol,
                     quote_volume=vol * curr_close_f,
+                    atr=curr_atr,
+                    ema20=curr_ema20,
                 )
                 logger.info(
                     "[CANDIDATE FOUND] %s: Close=$%.4f > EMA=$%.4f | RSI %.2f -> %.2f (bounce: +%.2f) | Vol: %.2f",

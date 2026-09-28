@@ -88,6 +88,10 @@ def save_state(
             "order_id": str(client_order_id) if client_order_id is not None else None,
             "entry_timestamp": str(entry_timestamp) if entry_timestamp is not None else None,
             "last_known_pnl": float(last_known_pnl) if last_known_pnl is not None else 0.0,
+            "highest_price": float(kwargs.get("highest_price") if kwargs.get("highest_price") is not None else (entry_price or 0.0)),
+            "atr_at_entry": float(kwargs.get("atr_at_entry") or 0.0),
+            "current_stop_price": float(kwargs.get("current_stop_price") or 0.0),
+            "candles_held": int(kwargs.get("candles_held") or 0),
         }
 
     payload["active_positions"] = positions_dict
@@ -103,7 +107,7 @@ def save_state(
     elif "screener_timestamp" not in payload:
         payload["screener_timestamp"] = None
 
-    # 3. Maintain top-level backward compatibility keys for legacy tests
+    # 3. Maintain top-level backward compatibility keys for legacy tests & quant state
     if entry_price is not None:
         payload["entry_price"] = float(entry_price)
     elif positions_dict:
@@ -125,6 +129,35 @@ def save_state(
         payload["client_order_id"] = str(client_order_id)
     if last_known_pnl is not None:
         payload["last_known_pnl"] = float(last_known_pnl)
+
+    # Quant telemetry top-level persistence
+    if "highest_price" in kwargs:
+        payload["highest_price"] = float(kwargs["highest_price"])
+    elif positions_dict:
+        first_pos = next(iter(positions_dict.values()))
+        if "highest_price" in first_pos:
+            payload["highest_price"] = first_pos["highest_price"]
+
+    if "current_stop_price" in kwargs:
+        payload["current_stop_price"] = float(kwargs["current_stop_price"])
+    elif positions_dict:
+        first_pos = next(iter(positions_dict.values()))
+        if "current_stop_price" in first_pos:
+            payload["current_stop_price"] = first_pos["current_stop_price"]
+
+    if "atr_at_entry" in kwargs:
+        payload["atr_at_entry"] = float(kwargs["atr_at_entry"])
+    elif positions_dict:
+        first_pos = next(iter(positions_dict.values()))
+        if "atr_at_entry" in first_pos:
+            payload["atr_at_entry"] = first_pos["atr_at_entry"]
+
+    if "candles_held" in kwargs:
+        payload["candles_held"] = int(kwargs["candles_held"])
+    elif positions_dict:
+        first_pos = next(iter(positions_dict.values()))
+        if "candles_held" in first_pos:
+            payload["candles_held"] = first_pos["candles_held"]
 
     # Normalize state key if enum
     if hasattr(payload.get("state"), "value"):
@@ -178,12 +211,17 @@ def load_state(file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
                 data["active_positions"] = {}
                 if data.get("entry_price") is not None or data.get("holding_amount") is not None:
                     target_sym = data.get("target_symbol") or data.get("symbol") or "SOL/USDT"
+                    entry_p = data.get("entry_price")
                     data["active_positions"][target_sym] = {
-                        "entry_price": data.get("entry_price"),
+                        "entry_price": entry_p,
                         "amount": data.get("holding_amount"),
                         "order_id": data.get("client_order_id"),
                         "entry_timestamp": data.get("entry_timestamp"),
                         "last_known_pnl": data.get("last_known_pnl"),
+                        "highest_price": data.get("highest_price") or entry_p,
+                        "atr_at_entry": data.get("atr_at_entry", 0.0),
+                        "current_stop_price": data.get("current_stop_price", 0.0),
+                        "candles_held": data.get("candles_held", 0),
                     }
 
             if "screener_cache" not in data:
@@ -198,6 +236,14 @@ def load_state(file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
                     data["entry_price"] = first_pos["entry_price"]
                 if data.get("holding_amount") is None:
                     data["holding_amount"] = first_pos.get("amount") or first_pos.get("holding_amount")
+                if data.get("highest_price") is None and "highest_price" in first_pos:
+                    data["highest_price"] = first_pos["highest_price"]
+                if data.get("current_stop_price") is None and "current_stop_price" in first_pos:
+                    data["current_stop_price"] = first_pos["current_stop_price"]
+                if data.get("atr_at_entry") is None and "atr_at_entry" in first_pos:
+                    data["atr_at_entry"] = first_pos["atr_at_entry"]
+                if data.get("candles_held") is None and "candles_held" in first_pos:
+                    data["candles_held"] = first_pos["candles_held"]
 
             return data
     except Exception as e:

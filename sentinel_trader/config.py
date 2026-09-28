@@ -108,7 +108,7 @@ class Config(BaseSettings):
         description="Initial position cost basis. If None, captures initial market price at launch",
     )
 
-    # Mathematical Risk Engine Thresholds
+    # Mathematical Risk Engine Thresholds & Institutional Quant Mechanics
     take_profit_pct: float = Field(
         default=0.05,
         description="Hard mathematical Take-Profit limit (e.g. 0.05 for +5%)",
@@ -116,6 +116,23 @@ class Config(BaseSettings):
     stop_loss_pct: float = Field(
         default=0.025,
         description="Hard mathematical Stop-Loss limit (e.g. 0.025 for -2.5%)",
+    )
+    portfolio_risk_per_trade_pct: float = Field(
+        default=0.01,
+        ge=0.0001,
+        le=0.20,
+        description="Fixed Fractional Risk: fraction of total portfolio equity risked per trade (default 0.01 = 1.0%)",
+    )
+    atr_sl_multiplier: float = Field(
+        default=1.5,
+        gt=0.0,
+        le=10.0,
+        description="ATR multiplier for initial stop-loss distance (default 1.5)",
+    )
+    max_holding_candles: int = Field(
+        default=16,
+        ge=1,
+        description="Maximum holding candles before Alpha Decay Time Stop liquidation (default 16 = 4 hours on 15m)",
     )
     panic_sell_confidence_threshold: float = Field(
         default=0.70,

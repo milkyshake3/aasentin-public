@@ -233,6 +233,80 @@ class ExchangeClient:
             logger.error("Failed to fetch balance for asset %s: %s", target_asset, e)
             raise
 
+    async def get_total_equity(self) -> float:
+        """Calculate total portfolio equity in quote currency (USDT)."""
+        quote_asset = self.config.quote_asset
+        free_quote = await self.get_balance(quote_asset)
+        total_equity = free_quote
+
+        if self.is_mock:
+            for asset, bal in self._mock_balances.items():
+                if asset != quote_asset and bal > 0:
+                    sym = f"{asset}/{quote_asset}"
+                    price = self._mock_prices.get(sym, 0.0)
+                    total_equity += bal * price
+            return total_equity
+
+        client = self.order_exchange or self.data_exchange
+        if client is not None:
+            try:
+                balance = await client.fetch_balance()
+                total_dict = balance.get("total", {}) or balance.get("free", {})
+                for asset, amt_val in total_dict.items():
+                    amt = float(amt_val or 0.0)
+                    if asset != quote_asset and amt > 0:
+                        sym = f"{asset}/{quote_asset}"
+                        try:
+                            price = await self.get_ticker_price(sym)
+                            total_equity += amt * price
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug("Failed to calculate total equity from exchange balance: %s", e)
+        return total_equity
+
+    def calculate_volatility_parity_sizing(
+        self,
+        total_equity: float,
+        free_usdt: float,
+        entry_price: float,
+        atr: float,
+        portfolio_risk_per_trade_pct: Optional[float] = None,
+        atr_sl_multiplier: Optional[float] = None,
+    ) -> float:
+        """Calculate position sizing via Fixed Fractional Risk / Volatility Parity.
+
+        stop_distance = atr * config.atr_sl_multiplier
+        dollar_risk = total_equity * config.portfolio_risk_per_trade_pct
+        target_quantity = dollar_risk / stop_distance
+        # Cap maximum slot allocation to 33% of free USDT to prevent over-allocation on low-vol assets
+        max_slot_usdt = free_usdt * 0.33
+        cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+        """
+        if free_usdt <= 0.0 or entry_price <= 0.0:
+            return 0.0
+
+        risk_pct = (
+            portfolio_risk_per_trade_pct
+            if portfolio_risk_per_trade_pct is not None
+            else getattr(self.config, "portfolio_risk_per_trade_pct", 0.01)
+        )
+        sl_multiplier = (
+            atr_sl_multiplier
+            if atr_sl_multiplier is not None
+            else getattr(self.config, "atr_sl_multiplier", 1.5)
+        )
+
+        stop_distance = atr * sl_multiplier
+        if stop_distance <= 0:
+            return 0.0
+
+        dollar_risk = total_equity * risk_pct
+        target_quantity = dollar_risk / stop_distance
+        max_slot_usdt = free_usdt * 0.33
+        cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+        return cost_usdt
+
     def truncate_amount(self, symbol: str, amount: float) -> float:
         """Strictly truncate order amount downward (ROUND_DOWN / TRUNCATE) to stepSize precision.
 

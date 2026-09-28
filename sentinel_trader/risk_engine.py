@@ -53,10 +53,13 @@ class TriggerReason(str, Enum):
     AI_PANIC_SELL = "AI_PANIC_SELL"
     GLOBAL_MACRO_BREAKER = "GLOBAL_MACRO_BREAKER"
     MANUAL_EMERGENCY = "MANUAL_EMERGENCY"
+    CHANDELIER_STOP = "CHANDELIER_STOP"
+    FAIR_VALUE_REVERSION = "FAIR_VALUE_REVERSION"
+    ALPHA_DECAY_TIME_STOP = "ALPHA_DECAY_TIME_STOP"
 
 
 class PositionState(BaseModel):
-    """State tracking for a single portfolio slot position."""
+    """State tracking for a single portfolio slot position with Institutional Quant Mechanics."""
 
     symbol: str
     entry_price: float
@@ -65,6 +68,21 @@ class PositionState(BaseModel):
     entry_timestamp: Optional[str] = None
     last_known_pnl: float = 0.0
     is_liquidated: bool = False
+    highest_price: float = 0.0
+    atr_at_entry: float = 0.0
+    current_stop_price: float = 0.0
+    candles_held: int = 0
+
+    def model_post_init(self, __context: Any) -> None:
+        """Initialize highest_price and current_stop_price defaults if unpopulated."""
+        if self.highest_price <= 0.0:
+            self.highest_price = self.entry_price
+
+        if self.current_stop_price <= 0.0:
+            if self.atr_at_entry > 0.0:
+                self.current_stop_price = round(self.entry_price - (self.atr_at_entry * 1.5), 4)
+            else:
+                self.current_stop_price = round(self.entry_price * 0.975, 4)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert position state to dictionary matching persistence schema."""
@@ -75,6 +93,10 @@ class PositionState(BaseModel):
             "entry_timestamp": self.entry_timestamp,
             "last_known_pnl": self.last_known_pnl,
             "is_liquidated": self.is_liquidated,
+            "highest_price": self.highest_price,
+            "atr_at_entry": self.atr_at_entry,
+            "current_stop_price": self.current_stop_price,
+            "candles_held": self.candles_held,
         }
 
     def __getitem__(self, item: str) -> Any:
@@ -142,11 +164,16 @@ class RiskEngine:
         # Initialize single default slot if initial_entry_price provided
         if initial_entry_price is not None and initial_entry_price > 0:
             sym = self.config.target_symbol
+            sl_mult = getattr(self.config, "atr_sl_multiplier", 1.5)
             self.positions[sym] = PositionState(
                 symbol=sym,
                 entry_price=initial_entry_price,
                 amount=initial_holding_amount or 0.0,
                 entry_timestamp=datetime.now(timezone.utc).isoformat(),
+                highest_price=initial_entry_price,
+                atr_at_entry=0.0,
+                current_stop_price=round(initial_entry_price * (1.0 - self.config.stop_loss_pct), 4),
+                candles_held=0,
             )
 
     # =========================================================================
@@ -198,7 +225,7 @@ class RiskEngine:
                 p.is_liquidated = True
 
     # =========================================================================
-    # Multi-Slot Portfolio Operations
+    # Multi-Slot Portfolio Operations & Quant Sizing
     # =========================================================================
 
     @property
@@ -214,12 +241,59 @@ class RiskEngine:
         """Check if portfolio has an open slot under MAX_ACTIVE_POSITIONS."""
         return len(self.active_positions) < self.max_active_positions
 
-    def calculate_slot_size(self, free_usdt: float) -> float:
-        """Determine position allocation sizing (25% free balance, min $15)."""
+    def calculate_slot_size(
+        self,
+        free_usdt: float,
+        atr: Optional[float] = None,
+        entry_price: Optional[float] = None,
+        total_equity: Optional[float] = None,
+    ) -> float:
+        """Determine position allocation sizing.
+
+        When atr and entry_price are supplied, uses Volatility Parity Fixed Fractional Risk sizing:
+            stop_distance = atr * config.atr_sl_multiplier
+            dollar_risk = total_equity * config.portfolio_risk_per_trade_pct
+            target_quantity = dollar_risk / stop_distance
+            # Cap maximum slot allocation to 33% of free USDT to prevent over-allocation on low-vol assets
+            max_slot_usdt = free_usdt * 0.33
+            cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+        Otherwise, falls back to legacy slot allocation (SLOT_ALLOCATION_PCT = 0.25, min $15).
+        """
         if free_usdt < 15.0:
             return 0.0
+
+        if atr is not None and entry_price is not None and atr > 0 and entry_price > 0:
+            equity = total_equity if (total_equity is not None and total_equity > 0) else free_usdt
+            risk_pct = getattr(self.config, "portfolio_risk_per_trade_pct", 0.01)
+            sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
+
+            stop_distance = atr * sl_multiplier
+            if stop_distance <= 0:
+                return 0.0
+
+            dollar_risk = equity * risk_pct
+            target_quantity = dollar_risk / stop_distance
+            max_slot_usdt = free_usdt * 0.33
+            cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+            return cost_usdt
+
         allocated = free_usdt * self.slot_allocation_pct
         return max(allocated, 15.0)
+
+    def calculate_volatility_parity_slot_size(
+        self,
+        free_usdt: float,
+        atr: float,
+        entry_price: float,
+        total_equity: Optional[float] = None,
+    ) -> float:
+        """Explicitly compute Volatility Parity Position Sizing (Fixed Fractional Risk)."""
+        return self.calculate_slot_size(
+            free_usdt=free_usdt,
+            atr=atr,
+            entry_price=entry_price,
+            total_equity=total_equity,
+        )
 
     def open_position(
         self,
@@ -228,13 +302,22 @@ class RiskEngine:
         amount: float,
         order_id: Optional[str] = None,
         entry_timestamp: Optional[str] = None,
+        atr: Optional[float] = None,
     ) -> PositionState:
-        """Register a new active slot in the portfolio."""
+        """Register a new active slot in the portfolio with fixed ATR snapshot and chandelier stop."""
         if len(self.active_positions) >= self.max_active_positions:
             raise ValueError(
                 f"MAX_ACTIVE_POSITIONS ({self.max_active_positions}) reached. "
                 f"Cannot open slot for {symbol}."
             )
+
+        atr_val = float(atr or 0.0)
+        sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
+        init_stop = (
+            round(entry_price - (atr_val * sl_multiplier), 4)
+            if atr_val > 0.0
+            else round(entry_price * (1.0 - self.config.stop_loss_pct), 4)
+        )
 
         pos = PositionState(
             symbol=symbol,
@@ -244,17 +327,34 @@ class RiskEngine:
             entry_timestamp=entry_timestamp or datetime.now(timezone.utc).isoformat(),
             last_known_pnl=0.0,
             is_liquidated=False,
+            highest_price=entry_price,
+            atr_at_entry=atr_val,
+            current_stop_price=init_stop,
+            candles_held=0,
         )
         self.positions[symbol] = pos
         logger.info(
-            "[SLOT OPENED] %s: Entry $%.4f | Size: %.4f | Slots: %d/%d",
+            "[SLOT OPENED] %s: Entry $%.4f | ATR: %.4f | Initial Stop: $%.4f | Size: %.4f | Slots: %d/%d",
             symbol,
             entry_price,
+            atr_val,
+            init_stop,
             amount,
             len(self.active_positions),
             self.max_active_positions,
         )
         return pos
+
+    def increment_candle(self, symbol: Optional[str] = None) -> None:
+        """Increment candles_held for a specific slot or default target."""
+        sym = symbol or self.config.target_symbol
+        if sym in self.positions and not self.positions[sym].is_liquidated:
+            self.positions[sym].candles_held += 1
+
+    def increment_all_candles(self) -> None:
+        """Increment candles_held counter across all active positions at 15m candle close."""
+        for pos in self.active_positions.values():
+            pos.candles_held += 1
 
     def close_position(self, symbol: str) -> None:
         """Close and mark a slot position as liquidated."""
@@ -262,13 +362,24 @@ class RiskEngine:
             self.positions[symbol].is_liquidated = True
             self.positions[symbol].amount = 0.0
 
-    def set_entry_price(self, price: float, symbol: Optional[str] = None) -> None:
+    def set_entry_price(self, price: float, symbol: Optional[str] = None, atr: Optional[float] = None) -> None:
         """Set cost basis entry price for target symbol or specified slot."""
         if price <= 0:
             raise ValueError(f"Entry price must be positive, got {price}")
         sym = symbol or self.config.target_symbol
+        atr_val = float(atr or 0.0)
+        sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
+        init_stop = (
+            round(price - (atr_val * sl_multiplier), 4)
+            if atr_val > 0.0
+            else round(price * (1.0 - self.config.stop_loss_pct), 4)
+        )
         if sym in self.positions:
             self.positions[sym].entry_price = price
+            self.positions[sym].highest_price = price
+            self.positions[sym].atr_at_entry = atr_val
+            self.positions[sym].current_stop_price = init_stop
+            self.positions[sym].candles_held = 0
             self.positions[sym].is_liquidated = False
         else:
             self.positions[sym] = PositionState(
@@ -276,28 +387,56 @@ class RiskEngine:
                 entry_price=price,
                 amount=self._default_holding_amount or 0.0,
                 entry_timestamp=datetime.now(timezone.utc).isoformat(),
+                highest_price=price,
+                atr_at_entry=atr_val,
+                current_stop_price=init_stop,
+                candles_held=0,
             )
         self._default_entry_price = price
-        logger.info("[ENTRY PRICE ESTABLISHED] %s entry locked at $%.4f", sym, price)
+        logger.info("[ENTRY PRICE ESTABLISHED] %s entry locked at $%.4f | Stop: $%.4f", sym, price, init_stop)
 
-    def rehydrate(self, entry_price: float, holding_amount: Optional[float] = None) -> None:
+    def rehydrate(
+        self,
+        entry_price: float,
+        holding_amount: Optional[float] = None,
+        atr: Optional[float] = None,
+        highest_price: Optional[float] = None,
+        current_stop_price: Optional[float] = None,
+        candles_held: int = 0,
+    ) -> None:
         """Rehydrate single target symbol state after restart or crash."""
         sym = self.config.target_symbol
+        atr_val = float(atr or 0.0)
+        sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
+        init_stop = (
+            current_stop_price
+            if current_stop_price is not None and current_stop_price > 0
+            else (
+                round(entry_price - (atr_val * sl_multiplier), 4)
+                if atr_val > 0.0
+                else round(entry_price * (1.0 - self.config.stop_loss_pct), 4)
+            )
+        )
         self.positions[sym] = PositionState(
             symbol=sym,
             entry_price=entry_price,
             amount=holding_amount or 0.0,
             entry_timestamp=datetime.now(timezone.utc).isoformat(),
             is_liquidated=False,
+            highest_price=highest_price or entry_price,
+            atr_at_entry=atr_val,
+            current_stop_price=init_stop,
+            candles_held=candles_held,
         )
-        self.set_entry_price(entry_price, symbol=sym)
+        self.set_entry_price(entry_price, symbol=sym, atr=atr)
         self.holding_amount = holding_amount
         self.is_liquidated = False
         self.last_liquidation = None
         logger.info(
-            "[RISK ENGINE REHYDRATED] Symbol: %s | Cost basis: $%.4f | Size: %s",
+            "[RISK ENGINE REHYDRATED] Symbol: %s | Cost basis: $%.4f | Stop: $%.4f | Size: %s",
             sym,
             entry_price,
+            init_stop,
             f"{holding_amount:.4f}" if holding_amount is not None else "N/A",
         )
 
@@ -313,6 +452,10 @@ class RiskEngine:
             ts = data.get("entry_timestamp")
             pnl = float(data.get("last_known_pnl") or 0.0)
             is_liq = bool(data.get("is_liquidated", False))
+            highest_p = float(data.get("highest_price") or entry_p)
+            atr_val = float(data.get("atr_at_entry") or 0.0)
+            current_stop = float(data.get("current_stop_price") or 0.0)
+            candles = int(data.get("candles_held") or 0)
 
             if entry_p > 0 and amt > 0 and not is_liq:
                 self.positions[symbol] = PositionState(
@@ -323,6 +466,10 @@ class RiskEngine:
                     entry_timestamp=ts,
                     last_known_pnl=pnl,
                     is_liquidated=False,
+                    highest_price=highest_p,
+                    atr_at_entry=atr_val,
+                    current_stop_price=current_stop,
+                    candles_held=candles,
                 )
         self.last_liquidation = None
         logger.info("[RISK ENGINE REHYDRATED] Rehydrated %d active slots.", len(self.active_positions))
@@ -332,9 +479,17 @@ class RiskEngine:
         initial_entry_price: Optional[float] = None,
         holding_amount: Optional[float] = None,
         symbol: Optional[str] = None,
+        atr: Optional[float] = None,
     ) -> None:
         """Reset risk engine state or single slot."""
         sym = symbol or self.config.target_symbol
+        atr_val = float(atr or 0.0)
+        sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
+        init_stop = (
+            round(initial_entry_price - (atr_val * sl_multiplier), 4)
+            if initial_entry_price and atr_val > 0.0
+            else (round(initial_entry_price * (1.0 - self.config.stop_loss_pct), 4) if initial_entry_price else 0.0)
+        )
         if initial_entry_price:
             self.positions[sym] = PositionState(
                 symbol=sym,
@@ -342,6 +497,10 @@ class RiskEngine:
                 amount=holding_amount or 0.0,
                 entry_timestamp=datetime.now(timezone.utc).isoformat(),
                 is_liquidated=False,
+                highest_price=initial_entry_price,
+                atr_at_entry=atr_val,
+                current_stop_price=init_stop,
+                candles_held=0,
             )
             self._default_entry_price = initial_entry_price
             self._default_holding_amount = holding_amount
@@ -396,10 +555,24 @@ class RiskEngine:
         self,
         current_price: float,
         symbol: Optional[str] = None,
+        ema20: Optional[float] = None,
+        rsi: Optional[float] = None,
     ) -> Optional[TriggerReason]:
-        """Check if hard mathematical take-profit or stop-loss limits are breached.
+        """Check if quantitative or hard mathematical boundaries are breached.
 
-        100% deterministic mathematical evaluation.
+        100% deterministic evaluation implementing institutional quant mechanics:
+        1. Dynamic Trailing Stop (Chandelier Exit):
+           - highest_price = max(highest_price, current_price)
+           - trail_target = highest_price - (atr_at_entry * 2.0)
+           - current_stop_price = max(current_stop_price, trail_target)
+           - If current_price <= current_stop_price: Trigger liquidation (CHANDELIER_STOP).
+        2. Statistical Fair-Value Target (Mean Reversion Resolution):
+           - If current_price >= ema20 AND rsi >= 58.0 AND unrealized_pnl > 0:
+             Trigger liquidation (FAIR_VALUE_REVERSION).
+        3. Alpha Decay Time Stop:
+           - If candles_held >= MAX_HOLDING_CANDLES:
+             Trigger liquidation (ALPHA_DECAY_TIME_STOP).
+        4. Hard Take-Profit & Stop-Loss Boundaries (Safety ceilings & fallbacks).
         """
         sym = symbol or self.config.target_symbol
         pos = self.positions.get(sym)
@@ -409,10 +582,57 @@ class RiskEngine:
             return None
 
         pnl_pct = (current_price - basis) / basis
+        unrealized_pnl_usd = (current_price - basis) * (pos.amount if pos else (self.holding_amount or 0.0))
         if pos:
             pos.last_known_pnl = pnl_pct
 
-        # Take-Profit check
+        # 1. Dynamic Trailing Stop (Chandelier Exit)
+        if pos:
+            # Update peak price on each price tick
+            pos.highest_price = max(pos.highest_price, current_price)
+
+            if pos.atr_at_entry > 0:
+                trail_target = round(pos.highest_price - (pos.atr_at_entry * 2.0), 4)
+                # Ratchet: current_stop_price only ratchets UP, never down
+                pos.current_stop_price = max(pos.current_stop_price, trail_target)
+
+                if current_price <= pos.current_stop_price:
+                    logger.warning(
+                        "[CHANDELIER STOP BREACHED] %s: Price $%.4f <= Stop $%.4f | Highest: $%.4f | ATR: %.4f",
+                        sym,
+                        current_price,
+                        pos.current_stop_price,
+                        pos.highest_price,
+                        pos.atr_at_entry,
+                    )
+                    return TriggerReason.CHANDELIER_STOP
+
+        # 2. Statistical Fair-Value Target (Mean Reversion Resolution)
+        if ema20 is not None and rsi is not None:
+            if current_price >= ema20 and rsi >= 58.0 and (current_price > basis or unrealized_pnl_usd > 0):
+                logger.info(
+                    "[FAIR VALUE REVERSION] %s: Price $%.4f >= EMA20 $%.4f | RSI %.2f >= 58.0 | PnL: %+.2f%%",
+                    sym,
+                    current_price,
+                    ema20,
+                    rsi,
+                    pnl_pct * 100,
+                )
+                return TriggerReason.FAIR_VALUE_REVERSION
+
+        # 3. Alpha Decay Time Stop
+        if pos:
+            max_candles = getattr(self.config, "max_holding_candles", 16)
+            if pos.candles_held >= max_candles:
+                logger.warning(
+                    "[ALPHA DECAY TIME STOP] %s: Held for %d candles (>= max %d). Liquidating.",
+                    sym,
+                    pos.candles_held,
+                    max_candles,
+                )
+                return TriggerReason.ALPHA_DECAY_TIME_STOP
+
+        # 4. Hard Take-Profit limit (ceiling)
         if pnl_pct >= self.config.take_profit_pct:
             logger.warning(
                 "[TAKE-PROFIT BREACHED] %s PnL %+.2f%% exceeds target limit +%.2f%%",
@@ -422,15 +642,16 @@ class RiskEngine:
             )
             return TriggerReason.TAKE_PROFIT
 
-        # Stop-Loss check
-        if pnl_pct <= -self.config.stop_loss_pct:
-            logger.warning(
-                "[STOP-LOSS BREACHED] %s PnL %+.2f%% breaches stop loss limit -%.2f%%",
-                sym,
-                pnl_pct * 100,
-                self.config.stop_loss_pct * 100,
-            )
-            return TriggerReason.STOP_LOSS
+        # 5. Hard Stop-Loss fallback (when atr_at_entry == 0 or fixed SL breach)
+        if pos is None or pos.atr_at_entry <= 0:
+            if pnl_pct <= -self.config.stop_loss_pct:
+                logger.warning(
+                    "[STOP-LOSS BREACHED] %s PnL %+.2f%% breaches stop loss limit -%.2f%%",
+                    sym,
+                    pnl_pct * 100,
+                    self.config.stop_loss_pct * 100,
+                )
+                return TriggerReason.STOP_LOSS
 
         return None
 
@@ -678,8 +899,10 @@ class RiskEngine:
         news_analysis: Optional[NewsAnalysis] = None,
         symbol: Optional[str] = None,
         headline: str = "",
+        ema20: Optional[float] = None,
+        rsi: Optional[float] = None,
     ) -> Optional[LiquidationRecord]:
-        """Evaluate mathematical limits and optional AI news trigger on each tick.
+        """Evaluate quantitative exits, mathematical limits, and optional AI news trigger on each tick.
 
         Returns LiquidationRecord if liquidation occurred, None otherwise.
         """
@@ -695,14 +918,36 @@ class RiskEngine:
         if pos is None and self.entry_price is None:
             self.set_entry_price(current_price, symbol=sym)
 
-        # 1. Evaluate hard mathematical limits first (highest priority, 100% deterministic)
-        math_trigger = self.evaluate_mathematical_limits(current_price, symbol=sym)
+        # 1. Evaluate quantitative exits and mathematical limits first (highest priority, 100% deterministic)
+        math_trigger = self.evaluate_mathematical_limits(
+            current_price,
+            symbol=sym,
+            ema20=ema20,
+            rsi=rsi,
+        )
         if math_trigger is not None:
             pnl_pct, _ = self.calculate_pnl(current_price, symbol=sym)
-            notes = (
-                f"Mathematical threshold breached on {sym}: PnL {pnl_pct * 100:+.2f}% "
-                f"(TP: +{self.config.take_profit_pct * 100:.1f}%, SL: -{self.config.stop_loss_pct * 100:.1f}%)"
-            )
+            if math_trigger == TriggerReason.CHANDELIER_STOP:
+                notes = (
+                    f"Chandelier Trailing Stop triggered on {sym}: Price ${current_price:.4f} <= "
+                    f"Stop ${pos.current_stop_price if pos else 0.0:.4f} "
+                    f"(Peak ${pos.highest_price if pos else 0.0:.4f}, ATR {pos.atr_at_entry if pos else 0.0:.4f})"
+                )
+            elif math_trigger == TriggerReason.FAIR_VALUE_REVERSION:
+                notes = (
+                    f"Statistical Fair-Value Target reached on {sym}: Price ${current_price:.4f} >= EMA20 "
+                    f"${ema20:.4f if ema20 else 0.0:.4f}, RSI {rsi:.1f if rsi else 0.0:.1f} >= 58.0"
+                )
+            elif math_trigger == TriggerReason.ALPHA_DECAY_TIME_STOP:
+                notes = (
+                    f"Alpha Decay Time Stop triggered on {sym}: Held for {pos.candles_held if pos else 0} candles "
+                    f"(limit: {getattr(self.config, 'max_holding_candles', 16)})"
+                )
+            else:
+                notes = (
+                    f"Mathematical threshold breached on {sym}: PnL {pnl_pct * 100:+.2f}% "
+                    f"(TP: +{self.config.take_profit_pct * 100:.1f}%, SL: -{self.config.stop_loss_pct * 100:.1f}%)"
+                )
             return await self.execute_liquidation(math_trigger, notes=notes, symbol=sym)
 
         # 2. Evaluate AI news sentinel trigger if an analysis was provided
