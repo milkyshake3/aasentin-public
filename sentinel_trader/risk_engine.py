@@ -145,12 +145,14 @@ class RiskEngine:
         max_active_positions: Optional[int] = None,
         slot_allocation_pct: Optional[float] = None,
         trade_history_file: Optional[str] = None,
+        asset_scores_file: Optional[str] = None,
     ):
         self.config = config
         self.exchange = exchange
         self.max_active_positions = max_active_positions or getattr(config, "max_active_positions", MAX_ACTIVE_POSITIONS)
         self.slot_allocation_pct = slot_allocation_pct or getattr(config, "slot_allocation_pct", SLOT_ALLOCATION_PCT)
         self.trade_history_file = trade_history_file or getattr(config, "trade_history_file", None)
+        self.asset_scores_file = asset_scores_file or getattr(config, "asset_scores_file", None)
         self.positions: Dict[str, PositionState] = {}
         self.notifier = notifier or DiscordNotifier(self.config)
 
@@ -844,6 +846,7 @@ class RiskEngine:
         # Atomically record closed trade to persistent trade analytics
         try:
             from sentinel_trader.analytics import record_trade
+            candles_held = int(pos.candles_held) if pos else 0
             record_trade(
                 symbol=sym,
                 entry_price=entry_p,
@@ -854,6 +857,8 @@ class RiskEngine:
                 trigger_reason=trigger.value if hasattr(trigger, "value") else str(trigger),
                 file_path=self.trade_history_file,
                 config=self.config,
+                candles_held=candles_held,
+                asset_scores_file=getattr(self, "asset_scores_file", None),
             )
         except Exception as e:
             logger.error("Failed to record trade to analytics: %s", e)

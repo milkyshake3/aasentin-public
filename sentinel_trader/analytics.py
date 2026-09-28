@@ -10,13 +10,19 @@ import json
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger("sentinel.analytics")
 
 DEFAULT_TRADE_HISTORY_FILE = "trade_history.json"
 DEFAULT_MOCK_TRADE_HISTORY_FILE = "trade_history_mock.json"
 MOCK_TRADE_HISTORY_FILE = "trade_history_mock.json"
+DEFAULT_ASSET_SCORES_FILE = "asset_scores.json"
+DEFAULT_MOCK_ASSET_SCORES_FILE = "asset_scores_mock.json"
+
+# In-memory asset reliability scores cache
+asset_scores: Dict[str, Dict[str, Any]] = {}
 
 
 def resolve_trade_history_path(
@@ -44,6 +50,191 @@ def resolve_trade_history_path(
     return file_path or DEFAULT_TRADE_HISTORY_FILE
 
 
+def resolve_asset_scores_path(
+    file_path: Optional[str] = None,
+    config: Optional[Any] = None,
+) -> str:
+    """Resolve target asset scores file, isolating mock/test runs to asset_scores_mock.json."""
+    is_mock = False
+    if config is not None:
+        if isinstance(config, bool):
+            is_mock = config
+        else:
+            is_mock = bool(getattr(config, "mock_exchange", False))
+    elif os.environ.get("MOCK_EXCHANGE", "").lower() in ("true", "1", "yes") or os.environ.get("SENTINEL_MOCK_EXCHANGE", "").lower() in ("true", "1", "yes"):
+        is_mock = True
+
+    if is_mock:
+        if file_path is None or file_path == DEFAULT_ASSET_SCORES_FILE or os.path.abspath(file_path) == os.path.abspath(DEFAULT_ASSET_SCORES_FILE):
+            return DEFAULT_MOCK_ASSET_SCORES_FILE
+
+    return file_path or DEFAULT_ASSET_SCORES_FILE
+
+
+def calculate_score_adjustment(
+    score: float,
+    realized_pnl_usd: float,
+    realized_pnl_pct: float,
+    trigger_reason: Union[str, Any],
+    candles_held: int = 0,
+) -> float:
+    """Calculate the updated reliability score based on trade outcome.
+
+    Adjustment rules:
+    - Hard Stop Loss (CHANDELIER_STOP or PnL < -1.5%): S_new = S - 0.7
+    - Time Decay Scratch (ALPHA_DECAY_TIME_STOP or PnL <= 0): S_new = S - 0.3
+    - Fast Win (PnL > 0 and candles_held <= 6): S_new = min(S + 0.5, 3.0)
+    - Slow Win / Drag (PnL > 0 and candles_held > 10): S_new = min(S + 0.1, 3.0)
+    - Moderate Win (PnL > 0 and 6 < candles_held <= 10): S_new = min(S + 0.25, 3.0)
+    """
+    trigger_str = trigger_reason.value if hasattr(trigger_reason, "value") else str(trigger_reason)
+
+    # Normalize percentage to percent unit (e.g. -0.015 -> -1.5)
+    if abs(realized_pnl_pct) <= 1.0 and realized_pnl_pct != 0.0:
+        pct_value = realized_pnl_pct * 100.0
+    else:
+        pct_value = realized_pnl_pct
+
+    # Precedence 1: Hard Stop Loss (CHANDELIER_STOP or PnL < -1.5%)
+    if trigger_str == "CHANDELIER_STOP" or pct_value < -1.5:
+        new_score = score - 0.7
+    # Precedence 2: Time Decay Scratch (ALPHA_DECAY_TIME_STOP or PnL <= 0)
+    elif trigger_str == "ALPHA_DECAY_TIME_STOP" or pct_value <= 0.0 or realized_pnl_usd <= 0.0:
+        new_score = score - 0.3
+    # Precedence 3: Win (PnL > 0)
+    elif candles_held <= 6:
+        new_score = min(score + 0.5, 3.0)
+    elif candles_held > 10:
+        new_score = min(score + 0.1, 3.0)
+    else:
+        new_score = min(score + 0.25, 3.0)
+
+    return round(new_score, 4)
+
+
+def update_asset_score(
+    symbol: str,
+    realized_pnl_usd: float,
+    realized_pnl_pct: float,
+    trigger_reason: Union[str, Any],
+    candles_held: int = 0,
+    file_path: Optional[str] = None,
+    current_time: Optional[float] = None,
+    asset_scores_dict: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Update asset reliability score and manage penalty box state.
+
+    Args:
+        symbol: Trading pair symbol (e.g. 'SOL/USDT').
+        realized_pnl_usd: Profit or loss in USD.
+        realized_pnl_pct: Percentage profit or loss realized.
+        trigger_reason: Liquidation trigger reason.
+        candles_held: Number of 15m candles position was held.
+        file_path: Custom persistence file path for asset_scores.json.
+        current_time: Optional epoch timestamp override.
+        asset_scores_dict: Optional pre-loaded asset_scores dictionary.
+
+    Returns:
+        Dict[str, Any]: Updated asset score dict with 'score', 'penalized_until', 'trades_count'.
+    """
+    now_ts = current_time if current_time is not None else time.time()
+
+    should_save = False
+    if asset_scores_dict is not None:
+        scores = asset_scores_dict
+    else:
+        from sentinel_trader.state_store import load_asset_scores
+        scores = load_asset_scores(file_path=file_path, current_time=now_ts)
+        should_save = True
+
+    if symbol not in scores:
+        scores[symbol] = {
+            "score": 1.0,
+            "penalized_until": None,
+            "trades_count": 0,
+        }
+
+    entry = scores[symbol]
+
+    # Automatic unban check
+    if entry.get("penalized_until") is not None and now_ts >= entry["penalized_until"]:
+        entry["penalized_until"] = None
+        entry["score"] = 0.5
+        logger.info("[PENALTY BOX] %s reinstated with baseline score 0.5", symbol)
+
+    current_s = float(entry.get("score", 1.0))
+    new_s = calculate_score_adjustment(
+        score=current_s,
+        realized_pnl_usd=realized_pnl_usd,
+        realized_pnl_pct=realized_pnl_pct,
+        trigger_reason=trigger_reason,
+        candles_held=candles_held,
+    )
+    entry["score"] = new_s
+    entry["trades_count"] = int(entry.get("trades_count", 0)) + 1
+
+    # Penalty box trigger: S <= 0.0
+    if new_s <= 0.0:
+        entry["penalized_until"] = now_ts + 86400.0
+        iso_time = datetime.fromtimestamp(entry["penalized_until"], tz=timezone.utc).isoformat()
+        logger.warning(
+            "[PENALTY BOX] %s score fell to %.1f (<= 0.0). Penalized for 24 hours until %s.",
+            symbol,
+            new_s,
+            iso_time,
+        )
+
+    # Sync module-level dict
+    asset_scores[symbol] = entry
+
+    if should_save:
+        from sentinel_trader.state_store import save_asset_scores
+        save_asset_scores(scores, file_path=file_path)
+
+    return entry
+
+
+def get_asset_score(
+    symbol: str,
+    file_path: Optional[str] = None,
+    current_time: Optional[float] = None,
+    asset_scores_dict: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Retrieve score info for a symbol, unbanning if expired."""
+    now_ts = current_time if current_time is not None else time.time()
+    if asset_scores_dict is not None:
+        scores = asset_scores_dict
+    else:
+        from sentinel_trader.state_store import load_asset_scores
+        scores = load_asset_scores(file_path=file_path, current_time=now_ts)
+
+    if symbol not in scores:
+        return {
+            "score": 1.0,
+            "penalized_until": None,
+            "trades_count": 0,
+        }
+
+    entry = scores[symbol]
+    if entry.get("penalized_until") is not None and now_ts >= entry["penalized_until"]:
+        entry["penalized_until"] = None
+        entry["score"] = 0.5
+        if asset_scores_dict is None:
+            from sentinel_trader.state_store import save_asset_scores
+            save_asset_scores(scores, file_path=file_path)
+
+    return entry
+
+
+def get_all_asset_scores(
+    file_path: Optional[str] = None,
+    current_time: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Retrieve all asset reliability scores."""
+    from sentinel_trader.state_store import load_asset_scores
+    return load_asset_scores(file_path=file_path, current_time=current_time)
+
+
 def record_trade(
     symbol: str,
     entry_price: float,
@@ -55,8 +246,11 @@ def record_trade(
     file_path: Optional[str] = None,
     timestamp: Optional[str] = None,
     config: Optional[Any] = None,
+    candles_held: int = 0,
+    asset_scores_file: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Atomically record a closed trade into trade_history.json (or trade_history_mock.json).
+    """Atomically record a closed trade into trade_history.json (or trade_history_mock.json)
+    and update asset reliability score.
 
     Args:
         symbol: Trading pair symbol (e.g. 'SOL/USDT').
@@ -69,6 +263,8 @@ def record_trade(
         file_path: Optional path override for trade history JSON file.
         timestamp: Optional ISO-8601 timestamp string override.
         config: Optional configuration object or boolean (checks config.mock_exchange).
+        candles_held: Number of 15m candles position was held (default 0).
+        asset_scores_file: Optional path override for asset_scores.json.
 
     Returns:
         Dict[str, Any]: The newly recorded trade record dictionary.
@@ -88,6 +284,7 @@ def record_trade(
         "realized_pnl_pct": float(realized_pnl_pct),
         "trigger_reason": str(trigger_reason),
         "timestamp": str(iso_timestamp),
+        "candles_held": int(candles_held),
     }
 
     trades = load_trades(target_path)
@@ -113,7 +310,33 @@ def record_trade(
                 pass
         raise e
 
+    # Update asset reliability score and manage penalty box
+    scores_path = asset_scores_file
+    if scores_path is None:
+        if (
+            file_path is not None
+            and file_path != DEFAULT_TRADE_HISTORY_FILE
+            and file_path != DEFAULT_MOCK_TRADE_HISTORY_FILE
+        ):
+            scores_path = os.path.join(target_dir, DEFAULT_ASSET_SCORES_FILE)
+        else:
+            scores_path = resolve_asset_scores_path(None, config)
+
+    try:
+        update_asset_score(
+            symbol=symbol,
+            realized_pnl_usd=float(realized_pnl_usd),
+            realized_pnl_pct=float(realized_pnl_pct),
+            trigger_reason=trigger_reason,
+            candles_held=int(candles_held),
+            file_path=scores_path,
+        )
+    except Exception as e:
+        logger.error("Failed to update asset reliability score for %s: %s", symbol, e)
+
     return record
+
+
 
 
 def load_trades(

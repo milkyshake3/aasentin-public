@@ -54,6 +54,8 @@ logs/
 state.json
 trade_history.json
 trade_history_mock.json
+asset_scores.json
+asset_scores_mock.json
 order_history/
 news_cache.json
 .cache/

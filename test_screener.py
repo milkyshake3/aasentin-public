@@ -763,3 +763,280 @@ async def test_quant_liquidation_records_in_trade_history(tmp_path):
     assert "ALPHA_DECAY_TIME_STOP" in reasons
 
 
+# =====================================================================
+# 9. Reliability Scoring System & 24-Hour Penalty Box Tests
+# =====================================================================
+
+def test_reliability_score_adjustments():
+    """Verify reward and penalty score adjustments on trade close matching specification."""
+    from sentinel_trader.analytics import calculate_score_adjustment
+
+    # 1. Fast Win (PnL > 0 and candles_held <= 6): S_new = min(S + 0.5, 3.0)
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=50.0, realized_pnl_pct=0.03, trigger_reason="TAKE_PROFIT", candles_held=4) == 1.5
+    # Capped at 3.0
+    assert calculate_score_adjustment(2.8, realized_pnl_usd=50.0, realized_pnl_pct=0.03, trigger_reason="TAKE_PROFIT", candles_held=2) == 3.0
+
+    # 2. Slow Win / Drag (PnL > 0 and candles_held > 10): S_new = S + 0.1
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=10.0, realized_pnl_pct=0.01, trigger_reason="TAKE_PROFIT", candles_held=12) == 1.1
+
+    # 3. Time Decay Scratch (ALPHA_DECAY_TIME_STOP or PnL <= 0): S_new = S - 0.3
+    # Case A: ALPHA_DECAY_TIME_STOP trigger
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=1.0, realized_pnl_pct=0.001, trigger_reason="ALPHA_DECAY_TIME_STOP", candles_held=16) == 0.7
+    # Case B: PnL <= 0 (scratch, flat exit)
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=0.0, realized_pnl_pct=0.0, trigger_reason="MANUAL", candles_held=5) == 0.7
+    # Case C: Mild loss (e.g. -0.5% > -1.5%)
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=-5.0, realized_pnl_pct=-0.005, trigger_reason="STOP_LOSS", candles_held=8) == 0.7
+
+    # 4. Hard Stop Loss (CHANDELIER_STOP or PnL < -1.5%): S_new = S - 0.7
+    # Case A: CHANDELIER_STOP trigger
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=-10.0, realized_pnl_pct=-0.01, trigger_reason="CHANDELIER_STOP", candles_held=3) == 0.3
+    # Case B: PnL < -1.5% (e.g. -2.0% loss)
+    assert calculate_score_adjustment(1.0, realized_pnl_usd=-20.0, realized_pnl_pct=-0.02, trigger_reason="STOP_LOSS", candles_held=5) == 0.3
+
+
+def test_reliability_score_decay_until_penalty_box():
+    """Verify score decay on successive losses until an asset hits S <= 0.0 and enters 24h penalty box."""
+    from sentinel_trader.analytics import update_asset_score
+
+    scores: dict = {}
+    t0 = 1700000000.0
+
+    # 1. Initial State (starts at 1.0)
+    # Loss 1: Hard Stop Loss (-0.7) -> Score drops to 0.3
+    res1 = update_asset_score(
+        symbol="SOL/USDT",
+        realized_pnl_usd=-25.0,
+        realized_pnl_pct=-0.02,  # -2.0% < -1.5%
+        trigger_reason="STOP_LOSS",
+        candles_held=4,
+        current_time=t0,
+        asset_scores_dict=scores,
+    )
+    assert res1["score"] == 0.3
+    assert res1["trades_count"] == 1
+    assert res1["penalized_until"] is None
+
+    # Loss 2: Time Decay Scratch (-0.3) -> Score drops to 0.0 (S <= 0.0)
+    # Triggers 24-hour penalty box!
+    res2 = update_asset_score(
+        symbol="SOL/USDT",
+        realized_pnl_usd=-2.0,
+        realized_pnl_pct=-0.002,
+        trigger_reason="ALPHA_DECAY_TIME_STOP",
+        candles_held=16,
+        current_time=t0 + 100,
+        asset_scores_dict=scores,
+    )
+    assert res2["score"] == 0.0
+    assert res2["trades_count"] == 2
+    assert res2["penalized_until"] is not None
+    assert res2["penalized_until"] == (t0 + 100 + 86400.0)
+
+
+@pytest.mark.asyncio
+async def test_penalized_asset_excluded_from_dynamic_universe_even_rank_1(caplog):
+    """Verify penalized asset is excluded from get_dynamic_universe even if it ranks #1 by volume."""
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    mock_exchange = AsyncMock()
+    mock_exchange.is_mock = False
+    mock_exchange.markets = {}
+
+    # SOL/USDT ranks #1 with $1,000,000,000 quote volume!
+    mock_exchange.fetch_tickers = AsyncMock(
+        return_value={
+            "SOL/USDT": {"symbol": "SOL/USDT", "quoteVolume": 1000000000.0, "spot": True, "active": True},
+            "BTC/USDT": {"symbol": "BTC/USDT", "quoteVolume": 500000000.0, "spot": True, "active": True},
+            "ETH/USDT": {"symbol": "ETH/USDT", "quoteVolume": 250000000.0, "spot": True, "active": True},
+            "NEAR/USDT": {"symbol": "NEAR/USDT", "quoteVolume": 100000000.0, "spot": True, "active": True},
+        }
+    )
+
+    t_now = 1700000000.0
+    # SOL/USDT is currently penalized for 24 hours
+    scores = {
+        "SOL/USDT": {
+            "score": -0.4,
+            "penalized_until": t_now + 86400.0,
+            "trades_count": 3,
+        }
+    }
+
+    screener = UniverseScreener(cache_ttl_seconds=86400, asset_scores=scores)
+    universe = await screener.get_dynamic_universe(
+        mock_exchange,
+        top_n=3,
+        current_time=t_now,
+    )
+
+    # 1. SOL/USDT must NOT be present in universe despite #1 volume
+    assert "SOL/USDT" not in universe
+
+    # 2. Remaining pairs must be ranked properly: BTC #1, ETH #2, NEAR #3
+    assert universe == ["BTC/USDT", "ETH/USDT", "NEAR/USDT"]
+
+    # 3. Discarded candidate must be logged with specified format:
+    # [PENALTY BOX] {symbol} excluded (banned until {iso_time}, Score: {score:.1f})
+    expected_iso = datetime.fromtimestamp(t_now + 86400.0, tz=timezone.utc).isoformat()
+    expected_log_snippet = f"[PENALTY BOX] SOL/USDT excluded (banned until {expected_iso}, Score: -0.4)"
+    assert expected_log_snippet in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_penalized_asset_reinstated_after_24_hours():
+    """Verify asset reinstatement after 24 hours: score reset to 0.5 and re-included in universe."""
+    mock_exchange = AsyncMock()
+    mock_exchange.is_mock = False
+    mock_exchange.markets = {}
+
+    mock_exchange.fetch_tickers = AsyncMock(
+        return_value={
+            "SOL/USDT": {"symbol": "SOL/USDT", "quoteVolume": 1000000000.0, "spot": True, "active": True},
+            "BTC/USDT": {"symbol": "BTC/USDT", "quoteVolume": 500000000.0, "spot": True, "active": True},
+            "ETH/USDT": {"symbol": "ETH/USDT", "quoteVolume": 250000000.0, "spot": True, "active": True},
+        }
+    )
+
+    t0 = 1700000000.0
+    pen_until = t0 + 86400.0
+
+    scores = {
+        "SOL/USDT": {
+            "score": -0.4,
+            "penalized_until": pen_until,
+            "trades_count": 3,
+        }
+    }
+
+    screener = UniverseScreener(cache_ttl_seconds=86400, asset_scores=scores)
+
+    # At t0 + 12 hours: Still penalized
+    t_mid = t0 + 43200.0
+    u_mid = await screener.get_dynamic_universe(mock_exchange, top_n=3, current_time=t_mid, force_refresh=True)
+    assert "SOL/USDT" not in u_mid
+    assert screener.is_asset_penalized("SOL/USDT", current_time=t_mid) is True
+
+    # At t0 + 24 hours + 1 second: Ban expired, asset reinstated!
+    t_after = pen_until + 1.0
+    u_after = await screener.get_dynamic_universe(mock_exchange, top_n=3, current_time=t_after, force_refresh=True)
+
+    # Reinstated checks:
+    # 1. Re-included in dynamic universe at #1 spot based on quoteVolume
+    assert "SOL/USDT" in u_after
+    assert u_after[0] == "SOL/USDT"
+
+    # 2. is_asset_penalized returns False
+    assert screener.is_asset_penalized("SOL/USDT", current_time=t_after) is False
+
+    # 3. Score baseline reset to 0.5 and penalized_until cleared to None
+    sol_entry = screener.get_asset_score("SOL/USDT", current_time=t_after)
+    assert sol_entry["score"] == 0.5
+    assert sol_entry["penalized_until"] is None
+    assert sol_entry["trades_count"] == 3
+
+
+def test_asset_scores_atomic_persistence_and_unban_on_startup(tmp_path):
+    """Verify atomic persistence to asset_scores.json and automatic unbanning of expired entries on startup."""
+    from sentinel_trader.state_store import clear_asset_scores, load_asset_scores, save_asset_scores
+
+    scores_file = str(tmp_path / "asset_scores.json")
+    t0 = 1700000000.0
+
+    initial_scores = {
+        "SOL/USDT": {
+            "score": -0.4,
+            "penalized_until": t0 + 3600.0,  # Expired after 1 hour
+            "trades_count": 5,
+        },
+        "DOGE/USDT": {
+            "score": -0.7,
+            "penalized_until": t0 + 86400.0,  # Active for 24 hours
+            "trades_count": 2,
+        },
+        "BTC/USDT": {
+            "score": 2.0,
+            "penalized_until": None,
+            "trades_count": 4,
+        },
+    }
+
+    # 1. Atomically save scores to disk
+    save_asset_scores(initial_scores, file_path=scores_file)
+
+    # 2. Simulate startup 2 hours later (t0 + 7200s):
+    # SOL/USDT penalty has expired -> should automatically unban and reset score to 0.5
+    # DOGE/USDT penalty is still active -> remains penalized
+    # BTC/USDT -> unchanged
+    t_startup = t0 + 7200.0
+    loaded = load_asset_scores(file_path=scores_file, current_time=t_startup)
+
+    # Verify SOL/USDT automatically unbanned
+    assert loaded["SOL/USDT"]["penalized_until"] is None
+    assert loaded["SOL/USDT"]["score"] == 0.5
+    assert loaded["SOL/USDT"]["trades_count"] == 5
+
+    # Verify DOGE/USDT remains penalized
+    assert loaded["DOGE/USDT"]["penalized_until"] == t0 + 86400.0
+    assert loaded["DOGE/USDT"]["score"] == -0.7
+
+    # Verify BTC/USDT unchanged
+    assert loaded["BTC/USDT"]["score"] == 2.0
+    assert loaded["BTC/USDT"]["penalized_until"] is None
+
+    # Clear file
+    assert clear_asset_scores(scores_file) is True
+    assert load_asset_scores(scores_file) == {}
+
+
+@pytest.mark.asyncio
+async def test_risk_engine_record_trade_score_integration(tmp_path):
+    """Verify RiskEngine liquidation passes candles_held to record_trade and updates asset scores."""
+    from sentinel_trader.state_store import load_asset_scores
+
+    trade_file = str(tmp_path / "trade_history.json")
+    scores_file = str(tmp_path / "asset_scores.json")
+
+    config = Config(mock_exchange=True)
+    exchange = ExchangeClient(config)
+    risk = RiskEngine(
+        config,
+        exchange,
+        trade_history_file=trade_file,
+        asset_scores_file=scores_file,
+    )
+
+    # Open position with 4 candles held
+    risk.open_position("SOL/USDT", entry_price=100.0, amount=2.0)
+    risk.positions["SOL/USDT"].candles_held = 4
+    exchange.set_mock_balance("SOL", 2.0)
+    exchange.set_mock_price("SOL/USDT", 110.0)  # +10% gain -> Fast Win (candles_held <= 6)
+
+    # Execute Take Profit liquidation
+    rec = await risk.execute_liquidation(TriggerReason.TAKE_PROFIT, notes="Fast win test", symbol="SOL/USDT")
+    assert rec.trigger == TriggerReason.TAKE_PROFIT
+
+    # Verify asset score updated to 1.0 + 0.5 = 1.5
+    scores = load_asset_scores(scores_file)
+    assert "SOL/USDT" in scores
+    assert scores["SOL/USDT"]["score"] == 1.5
+    assert scores["SOL/USDT"]["trades_count"] == 1
+    assert scores["SOL/USDT"]["penalized_until"] is None
+
+    # Next trade on SOL/USDT: Chandelier Stop Loss
+    risk.open_position("SOL/USDT", entry_price=110.0, amount=2.0)
+    risk.positions["SOL/USDT"].candles_held = 3
+    exchange.set_mock_balance("SOL", 2.0)
+    exchange.set_mock_price("SOL/USDT", 100.0)
+
+    # Execute Chandelier Stop liquidation -> Hard Stop Loss (-0.7)
+    rec2 = await risk.execute_liquidation(TriggerReason.CHANDELIER_STOP, notes="Hard stop test", symbol="SOL/USDT")
+    assert rec2.trigger == TriggerReason.CHANDELIER_STOP
+
+    # Verify asset score dropped to 1.5 - 0.7 = 0.8
+    scores2 = load_asset_scores(scores_file)
+    assert scores2["SOL/USDT"]["score"] == 0.8
+    assert scores2["SOL/USDT"]["trades_count"] == 2
+
+
+

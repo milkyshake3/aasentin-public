@@ -86,13 +86,21 @@ from sentinel_trader.analytics import (
     calculate_metrics,
     record_trade,
     resolve_trade_history_path,
+    resolve_asset_scores_path,
 )
 from sentinel_trader.config import Config
 from sentinel_trader.exchange_client import ExchangeClient
 from sentinel_trader.news_watcher import NewsWatcher, NewsArticle
 from sentinel_trader.notifier import DiscordNotifier
 from sentinel_trader.risk_engine import RiskEngine, TriggerReason
-from sentinel_trader.state_store import DEFAULT_STATE_FILE, clear_state, load_state, save_state
+from sentinel_trader.state_store import (
+    DEFAULT_STATE_FILE,
+    clear_state,
+    load_asset_scores,
+    load_state,
+    save_asset_scores,
+    save_state,
+)
 from sentinel_trader.strategy import calculate_indicators, check_entry_signal, scan_universe_for_signals, Candidate
 from sentinel_trader.universe_screener import UniverseScreener, get_dynamic_universe
 
@@ -149,6 +157,7 @@ class SentinelTrader:
         max_cycles: Optional[int] = None,
         state_file: Optional[str] = None,
         trade_history_file: Optional[str] = None,
+        asset_scores_file: Optional[str] = None,
     ):
         self.config = config or Config()
         self.scenario = scenario or "default"
@@ -159,17 +168,25 @@ class SentinelTrader:
             getattr(self.config, "trade_history_file", None),
             config=self.config,
         )
+        self.asset_scores_file = asset_scores_file or resolve_asset_scores_path(
+            getattr(self.config, "asset_scores_file", None),
+            config=self.config,
+        )
         self.exchange = ExchangeClient(self.config)
         self.news_watcher = NewsWatcher(self.config)
         self.ai_sentinel = AISentinel(self.config)
         self.notifier = DiscordNotifier(self.config)
-        self.screener = UniverseScreener(cache_ttl_seconds=86400)
+        self.screener = UniverseScreener(
+            cache_ttl_seconds=86400,
+            asset_scores_file=self.asset_scores_file,
+        )
         self.risk_engine = RiskEngine(
             self.config,
             self.exchange,
             initial_entry_price=self.config.entry_price,
             notifier=self.notifier,
             trade_history_file=self.trade_history_file,
+            asset_scores_file=self.asset_scores_file,
         )
 
         self.state: BotState = BotState.CASH_SCANNING
@@ -279,6 +296,8 @@ class SentinelTrader:
 
         # Check crash recovery persistence
         saved_state = load_state(self.state_file)
+        self.asset_scores = load_asset_scores(getattr(self.config, "asset_scores_file", None))
+        self.screener.asset_scores = self.asset_scores
         recovered = False
 
         if saved_state and saved_state.get("screener_cache"):

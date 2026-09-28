@@ -7,12 +7,16 @@ Includes an in-memory 24-hour cache (TTL 86,400s) and liquid mock exchange fallb
 """
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("sentinel.screener")
+
+# In-memory asset reliability scores dictionary
+asset_scores: Dict[str, Dict[str, Any]] = {}
 
 STABLECOIN_BLACKLIST: Set[str] = {
     "USDC/USDT",
@@ -49,17 +53,21 @@ DEFAULT_MOCK_UNIVERSE: List[str] = [
 
 
 class UniverseScreener:
-    """Dynamic universe screener maintaining a 24-hour in-memory cache."""
+    """Dynamic universe screener maintaining a 24-hour in-memory cache and reliability penalty box."""
 
     def __init__(
         self,
         cache_ttl_seconds: int = 86400,
         whitelisted_symbols: Optional[Set[str]] = None,
+        asset_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+        asset_scores_file: Optional[str] = None,
     ):
         self.cache_ttl_seconds = cache_ttl_seconds
         self.whitelisted_symbols: Set[str] = set(whitelisted_symbols or set())
         self._cached_universe: Optional[List[str]] = None
         self._cache_timestamp: Optional[float] = None
+        self.asset_scores: Dict[str, Dict[str, Any]] = asset_scores if asset_scores is not None else {}
+        self.asset_scores_file: Optional[str] = asset_scores_file
 
     @property
     def cached_universe(self) -> Optional[List[str]]:
@@ -87,6 +95,39 @@ class UniverseScreener:
         self._cached_universe = list(universe)
         self._cache_timestamp = timestamp or time.time()
 
+    def get_asset_score(
+        self,
+        symbol: str,
+        current_time: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve score entry for an asset, automatically reconciling expired bans."""
+        now_ts = current_time if current_time is not None else time.time()
+        if symbol not in self.asset_scores:
+            from sentinel_trader.state_store import load_asset_scores
+            disk_scores = load_asset_scores(file_path=self.asset_scores_file, current_time=now_ts)
+            if symbol in disk_scores:
+                self.asset_scores[symbol] = disk_scores[symbol]
+            else:
+                return {"score": 1.0, "penalized_until": None, "trades_count": 0}
+
+        entry = self.asset_scores[symbol]
+        if entry.get("penalized_until") is not None and now_ts >= entry["penalized_until"]:
+            entry["penalized_until"] = None
+            entry["score"] = 0.5
+            logger.info("[PENALTY BOX] %s reinstated with baseline score 0.5", symbol)
+        return entry
+
+    def is_asset_penalized(
+        self,
+        symbol: str,
+        current_time: Optional[float] = None,
+    ) -> bool:
+        """Check if an asset is actively excluded under the 24-hour penalty box."""
+        now_ts = current_time if current_time is not None else time.time()
+        entry = self.get_asset_score(symbol, current_time=now_ts)
+        pen_until = entry.get("penalized_until")
+        return pen_until is not None and now_ts < pen_until
+
     async def get_dynamic_universe(
         self,
         exchange: Any,
@@ -94,6 +135,8 @@ class UniverseScreener:
         mock_exchange: Optional[bool] = None,
         force_refresh: bool = False,
         whitelisted_symbols: Optional[Set[str]] = None,
+        asset_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+        current_time: Optional[float] = None,
     ) -> List[str]:
         """Fetch all 24h tickers in a single call and return top_n pairs by quoteVolume.
 
@@ -103,14 +146,37 @@ class UniverseScreener:
         - Exclude Blacklisted Stablecoins & Fiat (STABLECOIN_BLACKLIST).
         - Safety Regex Filter: Exclude symbols containing 'USD' in base asset unless whitelisted.
         - Exclude leveraged tokens (symbols containing UP/, DOWN/, BULL/, BEAR/).
+        - Penalty Box Exclusion Filter: Exclude pairs where time.time() < penalized_until.
         - Sort remaining pairs descending by ticker['quoteVolume'] (24-hour USDT turnover).
         - Cache result for 24 hours unless force_refresh is True.
         """
+        now_ts = current_time if current_time is not None else time.time()
+
         # Resolve active whitelist for USD base asset safety filter
         active_whitelist: Set[str] = set(self.whitelisted_symbols)
         if whitelisted_symbols:
             active_whitelist.update(whitelisted_symbols)
         active_whitelist.update(WHITELISTED_USD_BASE_ASSETS)
+
+        # Resolve active reliability scores
+        if asset_scores is not None:
+            active_scores = asset_scores
+        elif self.asset_scores:
+            active_scores = self.asset_scores
+        elif self.asset_scores_file:
+            from sentinel_trader.state_store import load_asset_scores
+            active_scores = load_asset_scores(file_path=self.asset_scores_file, current_time=now_ts)
+            self.asset_scores = active_scores
+        else:
+            active_scores = {}
+
+        # Ensure expired entries in active_scores are automatically reinstated
+        for s, entry in list(active_scores.items()):
+            if isinstance(entry, dict) and entry.get("penalized_until") is not None:
+                if now_ts >= entry["penalized_until"]:
+                    entry["penalized_until"] = None
+                    entry["score"] = 0.5
+                    logger.info("[PENALTY BOX] %s reinstated with baseline score 0.5", s)
 
         # 1. Mock exchange support
         is_mock = False
@@ -126,7 +192,16 @@ class UniverseScreener:
 
         if is_mock:
             logger.info("[UNIVERSE SCREENER] Mock exchange active. Returning default liquid mock universe.")
-            return DEFAULT_MOCK_UNIVERSE[:top_n]
+            filtered_mock = []
+            for s in DEFAULT_MOCK_UNIVERSE:
+                entry = active_scores.get(s)
+                if entry and entry.get("penalized_until") is not None and now_ts < entry["penalized_until"]:
+                    iso_time = datetime.fromtimestamp(entry["penalized_until"], tz=timezone.utc).isoformat()
+                    score_val = float(entry.get("score", 0.0))
+                    logger.warning("[PENALTY BOX] %s excluded (banned until %s, Score: %.1f)", s, iso_time, score_val)
+                    continue
+                filtered_mock.append(s)
+            return filtered_mock[:top_n]
 
         # 2. In-memory 24-Hour Cache evaluation
         if not force_refresh and self.is_cache_valid():
@@ -134,7 +209,16 @@ class UniverseScreener:
                 "[UNIVERSE SCREENER] Cache hit: Returning cached universe (age: %.1fs)",
                 time.time() - (self._cache_timestamp or 0),
             )
-            return (self._cached_universe or [])[:top_n]
+            filtered_cache = []
+            for s in (self._cached_universe or []):
+                entry = active_scores.get(s)
+                if entry and entry.get("penalized_until") is not None and now_ts < entry["penalized_until"]:
+                    iso_time = datetime.fromtimestamp(entry["penalized_until"], tz=timezone.utc).isoformat()
+                    score_val = float(entry.get("score", 0.0))
+                    logger.warning("[PENALTY BOX] %s excluded (banned until %s, Score: %.1f)", s, iso_time, score_val)
+                    continue
+                filtered_cache.append(s)
+            return filtered_cache[:top_n]
 
         # 3. Single call to fetch all 24h tickers
         logger.info("[UNIVERSE SCREENER] Fetching all 24h tickers from exchange...")
@@ -207,6 +291,21 @@ class UniverseScreener:
             if not (is_spot and is_active):
                 continue
 
+            # Penalty Box Exclusion Filter: Exclude any pair where time.time() < penalized_until
+            score_entry = active_scores.get(symbol)
+            if score_entry and score_entry.get("penalized_until") is not None:
+                pen_until = score_entry["penalized_until"]
+                if now_ts < pen_until:
+                    iso_time = datetime.fromtimestamp(pen_until, tz=timezone.utc).isoformat()
+                    score_val = float(score_entry.get("score", 0.0))
+                    logger.warning(
+                        "[PENALTY BOX] %s excluded (banned until %s, Score: %.1f)",
+                        symbol,
+                        iso_time,
+                        score_val,
+                    )
+                    continue
+
             # Extract quoteVolume (24-hour USDT turnover)
             quote_vol = ticker.get("quoteVolume")
             if quote_vol is None and isinstance(ticker.get("info"), dict):
@@ -226,7 +325,7 @@ class UniverseScreener:
         universe = [symbol for symbol, _ in filtered]
 
         self._cached_universe = universe
-        self._cache_timestamp = time.time()
+        self._cache_timestamp = now_ts
         logger.info(
             "[UNIVERSE SCREENER] Dynamic universe updated: %d qualified spot pairs (top %d: %s)",
             len(universe),
@@ -247,6 +346,8 @@ async def get_dynamic_universe(
     mock_exchange: Optional[bool] = None,
     force_refresh: bool = False,
     whitelisted_symbols: Optional[Set[str]] = None,
+    asset_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+    current_time: Optional[float] = None,
 ) -> List[str]:
     """Top-level convenience method matching specification."""
     return await _default_screener.get_dynamic_universe(
@@ -255,4 +356,16 @@ async def get_dynamic_universe(
         mock_exchange=mock_exchange,
         force_refresh=force_refresh,
         whitelisted_symbols=whitelisted_symbols,
+        asset_scores=asset_scores,
+        current_time=current_time,
     )
+
+
+# Expose scoring functions from analytics for convenience
+from sentinel_trader.analytics import (
+    calculate_score_adjustment,
+    get_all_asset_scores,
+    get_asset_score,
+    update_asset_score,
+)
+

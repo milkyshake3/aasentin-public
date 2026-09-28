@@ -19,11 +19,13 @@ import json
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger("sentinel.state_store")
 
 DEFAULT_STATE_FILE = "state.json"
+DEFAULT_ASSET_SCORES_FILE = "asset_scores.json"
 
 
 def save_state(
@@ -270,3 +272,126 @@ def clear_state(file_path: Optional[str] = None) -> bool:
             logger.error("Failed to remove state file %s: %s", target_path, e)
             return False
     return True
+
+
+def save_asset_scores(
+    asset_scores: Dict[str, Dict[str, Any]],
+    file_path: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Atomically persist asset reliability scores to asset_scores.json using os.replace.
+
+    Args:
+        asset_scores: Performance tracking dictionary {symbol: {'score': float, 'penalized_until': Optional[float], 'trades_count': int}}.
+        file_path: Optional custom file path (defaults to 'asset_scores.json').
+
+    Returns:
+        Dict[str, Dict[str, Any]]: The persisted asset scores dictionary.
+    """
+    target_path = file_path or DEFAULT_ASSET_SCORES_FILE
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
+    os.makedirs(target_dir, exist_ok=True)
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=target_dir, delete=False, encoding="utf-8") as f:
+            temp_path = f.name
+            json.dump(asset_scores, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # CRITICAL FOR WINDOWS: File handle must be closed before calling os.replace
+        os.replace(temp_path, target_path)
+        logger.debug("Asset scores atomically persisted to %s", target_path)
+    except Exception as e:
+        logger.error("Failed to atomically persist asset scores to %s: %s", target_path, e)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
+
+    return asset_scores
+
+
+def load_asset_scores(
+    file_path: Optional[str] = None,
+    current_time: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Load persistent asset reliability scores from asset_scores.json and unban expired entries.
+
+    Args:
+        file_path: Optional custom file path (defaults to 'asset_scores.json').
+        current_time: Optional unix epoch timestamp for simulated time checks.
+
+    Returns:
+        Dict[str, Dict[str, Any]]: Reconciled dictionary of asset scores.
+    """
+    target_path = file_path or DEFAULT_ASSET_SCORES_FILE
+    if not os.path.exists(target_path):
+        return {}
+
+    now_ts = current_time if current_time is not None else time.time()
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning("Corrupted asset scores file %s. Expected dict.", target_path)
+                return {}
+
+        dirty = False
+        reconciled: Dict[str, Dict[str, Any]] = {}
+        for symbol, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            item = dict(entry)
+            score = float(item.get("score", 1.0))
+            penalized_until = item.get("penalized_until")
+            trades_count = int(item.get("trades_count", 0))
+
+            # Automatically unban expired entries
+            if penalized_until is not None:
+                pen_ts = float(penalized_until)
+                if now_ts >= pen_ts:
+                    item["penalized_until"] = None
+                    item["score"] = 0.5
+                    dirty = True
+                    logger.info("[PENALTY BOX] %s ban expired at %.1f. Reinstated with score 0.5.", symbol, pen_ts)
+                else:
+                    item["penalized_until"] = pen_ts
+
+            reconciled[symbol] = {
+                "score": float(item.get("score", 1.0)),
+                "penalized_until": item.get("penalized_until"),
+                "trades_count": trades_count,
+            }
+
+        if dirty:
+            save_asset_scores(reconciled, file_path=target_path)
+
+        return reconciled
+    except Exception as e:
+        logger.warning("Error reading asset scores file %s: %s. Returning empty scores.", target_path, e)
+        return {}
+
+
+def clear_asset_scores(file_path: Optional[str] = None) -> bool:
+    """Clear and remove the asset scores persistence file.
+
+    Args:
+        file_path: Optional custom file path (defaults to 'asset_scores.json').
+
+    Returns:
+        bool: True if cleared successfully or did not exist.
+    """
+    target_path = file_path or DEFAULT_ASSET_SCORES_FILE
+    if os.path.exists(target_path):
+        try:
+            os.remove(target_path)
+            logger.info("Cleared persistent asset scores file: %s", target_path)
+            return True
+        except Exception as e:
+            logger.error("Failed to remove asset scores file %s: %s", target_path, e)
+            return False
+    return True
+
