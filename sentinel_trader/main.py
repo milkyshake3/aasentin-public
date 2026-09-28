@@ -419,7 +419,11 @@ class SentinelTrader:
                         df.loc[df.index[-3], "close"] = 125.0
                         df.loc[df.index[-2], "close"] = 152.0
 
-                has_signal = check_entry_signal(df)
+                has_signal = check_entry_signal(
+                    df,
+                    rsi_threshold=self.config.rsi_oversold_threshold,
+                    ema_period=self.config.ema_period,
+                )
                 chosen_symbol = self.config.target_symbol
                 if not df.empty and "close" in df and len(df) >= 2:
                     curr_close = float(df["close"].iloc[-2])
@@ -432,9 +436,23 @@ class SentinelTrader:
                     self.exchange,
                     scan_symbols,
                     timeframe=self.config.timeframe,
+                    rsi_threshold=self.config.rsi_oversold_threshold,
+                    ema_period=self.config.ema_period,
                 )
                 open_slots = set(self.risk_engine.active_positions.keys())
                 available_candidates = [c for c in candidates if c.symbol not in open_slots]
+
+                # Rich console diagnostic display
+                if hasattr(candidates, "diagnostics") and candidates.diagnostics:
+                    console.print(f"[bold cyan][SCAN DIAGNOSTICS][/bold cyan] {len(candidates.diagnostics)} pairs evaluated:")
+                    for diag in candidates.diagnostics:
+                        style = "bold green" if diag.get("passed") else "dim"
+                        console.print(f"  [{style}]{diag['line']}[/{style}]")
+                    if not available_candidates:
+                        console.print(
+                            f"  [bold yellow][SCAN RESULT][/bold yellow] 0/{len(candidates.diagnostics)} "
+                            f"passed entry criteria. Maintaining 100% Cash."
+                        )
 
                 if available_candidates:
                     best = available_candidates[0]
@@ -451,7 +469,11 @@ class SentinelTrader:
                                 df.loc[df.index[-20 + k], "close"] = 150.0 - (k * 1.5)
                             df.loc[df.index[-3], "close"] = 125.0
                             df.loc[df.index[-2], "close"] = 152.0
-                        has_signal = check_entry_signal(df)
+                        has_signal = check_entry_signal(
+                            df,
+                            rsi_threshold=self.config.rsi_oversold_threshold,
+                            ema_period=self.config.ema_period,
+                        )
                         chosen_symbol = self.config.target_symbol
                         if not df.empty and "close" in df and len(df) >= 2:
                             curr_close = float(df["close"].iloc[-2])
@@ -479,7 +501,7 @@ class SentinelTrader:
             console.print(
                 f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                 f"[bold cyan][CASH_SCANNING][/bold cyan] Screened {len(universe)} pairs | Candidate: {chosen_symbol}: ${curr_close:.4f} | "
-                f"RSI(14): {curr_rsi:.1f} | EMA(200): ${curr_ema:.2f} | Free USDT: ${free_usdt:.2f} | "
+                f"RSI(14): {curr_rsi:.1f} | EMA({self.config.ema_period}): ${curr_ema:.2f} | Free USDT: ${free_usdt:.2f} | "
                 f"Signal: [{'bold green' if has_signal else 'dim'}]{has_signal}[/]"
             )
 

@@ -41,11 +41,18 @@ class OrderReceipt(BaseModel):
 
 
 class ExchangeClient:
-    """Async CCXT wrapper enforcing Binance Testnet safety invariant."""
+    """Async CCXT wrapper enforcing Dual-Client Architecture & Binance Testnet safety invariant:
+
+    - data_exchange: A public, unauthenticated ccxt.binance() instance pointing to LIVE production endpoints
+      (set_sandbox_mode(False)). Used strictly for fetch_tickers() and fetch_ohlcv().
+    - order_exchange: The authenticated client configured via .env (points to Testnet when BINANCE_SANDBOX=True).
+      Used strictly for balances and order placement (execute_market_buy, liquidate_to_usdt).
+    """
 
     def __init__(self, config: Config):
         self.config = config
-        self._exchange: Optional[ccxt.binance] = None
+        self.data_exchange: Optional[ccxt.binance] = None
+        self.order_exchange: Optional[ccxt.binance] = None
         self._is_initialized = False
         self._order_lock = asyncio.Lock()
 
@@ -60,22 +67,45 @@ class ExchangeClient:
         self._mock_ohlcv: Optional[pd.DataFrame] = None
 
     @property
+    def _exchange(self) -> Optional[ccxt.binance]:
+        """Backward-compatible exchange instance accessor (preferring order_exchange)."""
+        return self.order_exchange if self.order_exchange is not None else self.data_exchange
+
+    @_exchange.setter
+    def _exchange(self, value: Optional[ccxt.binance]) -> None:
+        self.order_exchange = value
+        if self.data_exchange is None or value is None:
+            self.data_exchange = value
+
+    @property
     def is_mock(self) -> bool:
         """Check if client is running in mock simulation mode."""
-        return self.config.mock_exchange or self._exchange is None
+        return self.config.mock_exchange or (self.order_exchange is None and self.data_exchange is None)
 
     async def initialize(self) -> None:
-        """Initialize the exchange connection and verify sandbox mode."""
+        """Initialize dual exchange connections: data_exchange (live) and order_exchange (testnet/live)."""
         # Auto-activate mock mode if explicitly requested OR if no API credentials provided
         if self.config.mock_exchange or not self.config.binance_api_key or not self.config.binance_api_secret:
             logger.info("[MOCK SIMULATION MODE] Initializing ExchangeClient in local mock mode.")
             self._is_initialized = True
             return
 
-        logger.info("Connecting to Binance Exchange client via CCXT...")
+        logger.info("Connecting to Binance Exchange clients via CCXT (Dual-Client Architecture)...")
 
-        # Initialize CCXT Binance async instance
-        exchange = ccxt.binance({
+        # 1. Market Data Client (data_exchange):
+        # Public, unauthenticated ccxt.binance() pointing to LIVE production endpoints (set_sandbox_mode(False)).
+        # Strictly for market data ingestion: fetch_tickers(), fetch_ohlcv(), get_ticker_price().
+        data_exchange = ccxt.binance({
+            'enableRateLimit': True,
+        })
+        data_exchange.set_sandbox_mode(False)
+        self.data_exchange = data_exchange
+        logger.info("[DUAL CLIENT: DATA] Initialized public unauthenticated live ccxt.binance (Sandbox=False) for market data.")
+
+        # 2. Order Execution Client (order_exchange):
+        # Authenticated client configured via .env (points to Testnet when BINANCE_SANDBOX=True).
+        # Strictly for balances and order placement (execute_market_buy, liquidate_to_usdt).
+        order_exchange = ccxt.binance({
             'apiKey': self.config.binance_api_key,
             'secret': self.config.binance_api_secret,
             'enableRateLimit': True,
@@ -83,41 +113,47 @@ class ExchangeClient:
 
         # SAFETY INVARIANT #3: Default strictly to Binance Testnet (Sandbox)
         if self.config.binance_sandbox:
-            exchange.set_sandbox_mode(True)
-            self._exchange = exchange
-            logger.info("[SAFETY CHECK: PASSED] Binance Sandbox (Testnet) Mode ENABLED.")
+            order_exchange.set_sandbox_mode(True)
+            self.order_exchange = order_exchange
+            logger.info("[DUAL CLIENT: ORDER] Binance Sandbox (Testnet) Mode ENABLED for order execution.")
         else:
             if not self.config.allow_production_trading:
-                await exchange.close()
+                await order_exchange.close()
+                await data_exchange.close()
+                self.order_exchange = None
+                self.data_exchange = None
                 raise PermissionError(
                     "FATAL SAFETY INVARIANT: Live Binance trading blocked. "
                     "ALLOW_PRODUCTION_TRADING must be explicitly set to True."
                 )
-            self._exchange = exchange
-            logger.warning("[WARNING: LIVE PRODUCTION] Operating on REAL Binance Mainnet!")
+            self.order_exchange = order_exchange
+            logger.warning("[WARNING: LIVE PRODUCTION] Operating on REAL Binance Mainnet for order execution!")
 
         try:
-            await self._exchange.load_markets()
+            await asyncio.gather(
+                self.data_exchange.load_markets(),
+                self.order_exchange.load_markets(),
+            )
             self._is_initialized = True
-            logger.info("Exchange markets loaded successfully.")
+            logger.info("Exchange markets loaded successfully for dual clients (data & order).")
         except Exception as e:
             logger.warning(
                 "Failed to connect/authenticate to Binance (%s). Falling back to mock exchange mode.",
                 e,
             )
             await self.close()
-            self._exchange = None
             self._is_initialized = True
 
     async def get_ticker_price(self, symbol: Optional[str] = None) -> float:
-        """Fetch live ticker/order book price from Binance Testnet or mock ledger."""
+        """Fetch live ticker/order book price strictly using live data_exchange or mock ledger."""
         sym = symbol or self.config.target_symbol
 
         if self.is_mock:
             return float(self._mock_prices.get(sym, 150.0))
 
+        client = self.data_exchange or self.order_exchange
         try:
-            ticker = await self._exchange.fetch_ticker(sym)
+            ticker = await client.fetch_ticker(sym)
             price = ticker.get("last") or ticker.get("close")
             if price is None:
                 bid = ticker.get("bid") or 0.0
@@ -133,9 +169,10 @@ class ExchangeClient:
 
     @property
     def markets(self) -> Dict[str, Any]:
-        """Expose CCXT exchange markets dict if loaded, or empty dict in mock mode."""
-        if self._exchange is not None and hasattr(self._exchange, "markets"):
-            return self._exchange.markets or {}
+        """Expose CCXT exchange markets dict if loaded, preferring data_exchange."""
+        client = self.data_exchange or self.order_exchange
+        if client is not None and hasattr(client, "markets"):
+            return client.markets or {}
         return {}
 
     async def fetch_tickers(
@@ -174,20 +211,22 @@ class ExchangeClient:
             return result
 
         try:
-            return await self._exchange.fetch_tickers(symbols=symbols, params=params or {})
+            client = self.data_exchange or self.order_exchange
+            return await client.fetch_tickers(symbols=symbols, params=params or {})
         except Exception as e:
             logger.error("Failed to fetch tickers: %s", e)
             raise
 
     async def get_balance(self, asset: Optional[str] = None) -> float:
-        """Fetch real free balance of the asset on Binance Testnet or mock ledger."""
+        """Fetch real free balance of the asset strictly from order_exchange (Binance Testnet or live) or mock ledger."""
         target_asset = asset or self.config.base_asset
 
         if self.is_mock:
             return float(self._mock_balances.get(target_asset, 0.0))
 
+        client = self.order_exchange or self.data_exchange
         try:
-            balance = await self._exchange.fetch_balance()
+            balance = await client.fetch_balance()
             free_balance = balance.get("free", {}).get(target_asset, 0.0)
             return float(free_balance or 0.0)
         except Exception as e:
@@ -203,12 +242,13 @@ class ExchangeClient:
         if amount <= 0.0:
             return 0.0
 
-        if self.is_mock or self._exchange is None:
+        client = self.order_exchange or self.data_exchange
+        if self.is_mock or client is None:
             d = Decimal(str(amount))
             return float(d.quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
 
         try:
-            market = self._exchange.market(symbol)
+            market = client.market(symbol)
             if hasattr(market, "__await__"):
                 # If mocked as coroutine
                 return float(Decimal(str(amount)).quantize(Decimal("0.001"), rounding=ROUND_DOWN))
@@ -216,8 +256,8 @@ class ExchangeClient:
             if precision is None:
                 return float(amount)
 
-            precision_mode = getattr(self._exchange, "precisionMode", DECIMAL_PLACES)
-            padding_mode = getattr(self._exchange, "paddingMode", 0)
+            precision_mode = getattr(client, "precisionMode", DECIMAL_PLACES)
+            padding_mode = getattr(client, "paddingMode", 0)
             truncated_str = decimal_to_precision(
                 str(amount), TRUNCATE, precision, precision_mode, padding_mode
             )
@@ -229,13 +269,40 @@ class ExchangeClient:
 
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         """Format order quantity truncated downward according to exchange LOT_SIZE step precision."""
-        if self._exchange is not None and hasattr(self._exchange, "amount_to_precision"):
+        client = self.order_exchange or self.data_exchange
+        if client is not None and hasattr(client, "amount_to_precision"):
             try:
-                prec_str = self._exchange.amount_to_precision(symbol, amount)
+                prec_str = client.amount_to_precision(symbol, amount)
                 return float(prec_str)
             except Exception:
                 pass
         return self.truncate_amount(symbol, amount)
+
+    async def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        since: Optional[int] = None,
+        limit: Optional[int] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        """Fetch raw historical OHLCV data strictly from live data_exchange."""
+        if self.is_mock:
+            df = await self.fetch_ohlcv_dataframe(symbol=symbol, timeframe=timeframe, limit=limit or 200)
+            return df.values.tolist()
+
+        client = self.data_exchange or self.order_exchange
+        try:
+            return await client.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                since=since,
+                limit=limit,
+                params=params or {},
+            )
+        except Exception as e:
+            logger.error("Failed to fetch raw OHLCV for %s (%s): %s", symbol, timeframe, e)
+            raise
 
     async def fetch_ohlcv_dataframe(
         self,
@@ -243,11 +310,11 @@ class ExchangeClient:
         timeframe: str = "15m",
         limit: int = 200,
     ) -> pd.DataFrame:
-        """Fetch historical OHLCV data as a Pandas DataFrame.
+        """Fetch historical OHLCV data as a Pandas DataFrame strictly using live data_exchange.
 
         If running in mock simulation mode, generates realistic synthetic OHLCV candles
         or returns injected mock candles if set.
-        In live/sandbox mode, fetches real candles via CCXT exchange.fetch_ohlcv.
+        In live/sandbox mode, fetches real candles via CCXT data_exchange.fetch_ohlcv.
 
         Args:
             symbol: Trading pair symbol (e.g. 'SOL/USDT'). Defaults to config.target_symbol.
@@ -284,8 +351,9 @@ class ExchangeClient:
 
             return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
 
+        client = self.data_exchange or self.order_exchange
         try:
-            raw_candles = await self._exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            raw_candles = await client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
             if not raw_candles:
                 logger.warning("Empty OHLCV data received for %s (%s)", sym, timeframe)
                 return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -771,13 +839,14 @@ class ExchangeClient:
         return new_price
 
     async def close(self) -> None:
-        """Gracefully close the underlying CCXT async connection."""
-        if self._exchange is not None:
-            try:
-                await self._exchange.close()
-                logger.info("Exchange connection closed successfully.")
-            except Exception as e:
-                logger.warning("Error while closing exchange connection: %s", e)
-            finally:
-                self._exchange = None
-                self._is_initialized = False
+        """Gracefully close dual CCXT async connections."""
+        for name, client in [("data_exchange", self.data_exchange), ("order_exchange", self.order_exchange)]:
+            if client is not None:
+                try:
+                    await client.close()
+                    logger.info("Exchange %s connection closed successfully.", name)
+                except Exception as e:
+                    logger.warning("Error while closing %s connection: %s", name, e)
+        self.data_exchange = None
+        self.order_exchange = None
+        self._is_initialized = False

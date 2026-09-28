@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from sentinel_trader.config import Config
+
 logger = logging.getLogger("sentinel.strategy")
 
 
@@ -31,6 +33,30 @@ class Candidate(BaseModel):
     quote_volume: float = 0.0
 
 
+class CandidateList(list):
+    """Container for Candidate list that preserves list semantics while exposing diagnostic records."""
+
+    def __init__(
+        self,
+        candidates: List[Candidate],
+        diagnostics: Optional[List[Dict[str, Any]]] = None,
+        summary: str = "",
+    ):
+        super().__init__(candidates)
+        self.diagnostics: List[Dict[str, Any]] = diagnostics or []
+        self.summary: str = summary
+
+
+def format_price(val: float) -> str:
+    """Format price cleanly with commas and appropriate decimal precision for diagnostic scan output."""
+    if val >= 100:
+        return f"${round(val):,}"
+    elif val >= 1:
+        return f"${val:,.2f}"
+    else:
+        return f"${val:,.4f}"
+
+
 class IndicatorResult(tuple):
     """Container returning RSI and EMA, supporting tuple unpacking, attributes, and column access."""
 
@@ -46,7 +72,7 @@ class IndicatorResult(tuple):
         if isinstance(item, str):
             if item.lower() in ("rsi", "rsi14", "rsi_14"):
                 return self.rsi
-            if item.lower() in ("ema", "ema200", "ema_200"):
+            if item.lower() in ("ema", "ema200", "ema_200", "ema100", "ema_100"):
                 return self.ema
             if self.df is not None and item in self.df.columns:
                 return self.df[item]
@@ -107,14 +133,20 @@ def calculate_ema(series: pd.Series, span: int = 200, min_periods: int = 1) -> p
     return series.ewm(span=span, adjust=False, min_periods=min_periods).mean()
 
 
-def calculate_indicators(df: pd.DataFrame) -> IndicatorResult:
-    """Calculate RSI(14) and EMA(200) for a price dataframe.
+def calculate_indicators(
+    df: pd.DataFrame,
+    rsi_period: int = 14,
+    ema_period: int = 100,
+) -> IndicatorResult:
+    """Calculate RSI(14) and EMA for a price dataframe.
 
-    Adds 'rsi' and 'ema' columns to the dataframe in-place and returns an IndicatorResult
-    which can be unpacked as (rsi, ema) or accessed via attributes/keys.
+    Adds 'rsi', 'ema', 'rsi14', 'ema{period}', and 'ema200' columns to the dataframe in-place
+    and returns an IndicatorResult which can be unpacked as (rsi, ema) or accessed via attributes/keys.
 
     Args:
         df: Pandas DataFrame containing at least a 'close' (or 'Close') column.
+        rsi_period: Lookback period for Wilder's RSI (default: 14).
+        ema_period: Lookback period for EMA trend filter (default: 100).
 
     Returns:
         IndicatorResult: Unpackable as (rsi, ema), with .rsi and .ema attributes.
@@ -138,19 +170,27 @@ def calculate_indicators(df: pd.DataFrame) -> IndicatorResult:
     close_series = pd.to_numeric(df[close_col], errors="coerce")
 
     # Compute indicators
-    rsi_series = calculate_rsi(close_series, period=14)
-    ema_series = calculate_ema(close_series, span=200, min_periods=1)
+    rsi_series = calculate_rsi(close_series, period=rsi_period)
+    ema_series = calculate_ema(close_series, span=ema_period, min_periods=1)
 
     # Attach to dataframe in-place
     df["rsi"] = rsi_series
     df["ema"] = ema_series
     df["rsi14"] = rsi_series
-    df["ema200"] = ema_series
+    df[f"ema{ema_period}"] = ema_series
+    if ema_period != 200:
+        df["ema200"] = calculate_ema(close_series, span=200, min_periods=1)
+    else:
+        df["ema200"] = ema_series
 
     return IndicatorResult(rsi_series, ema_series, df=df)
 
 
-def check_entry_signal(df: pd.DataFrame) -> bool:
+def check_entry_signal(
+    df: pd.DataFrame,
+    rsi_threshold: float = 35.0,
+    ema_period: int = 200,
+) -> bool:
     """Check if the latest completed candles satisfy the active entry condition.
 
     Evaluates indicators strictly on finalized/completed bars to prevent mid-candle
@@ -160,14 +200,16 @@ def check_entry_signal(df: pd.DataFrame) -> bool:
     and the preceding finalized candle (df.iloc[-3]).
 
     Condition:
-        1. Last Finalized Close (df.iloc[-2]) > Finalized EMA(200) (df.iloc[-2]) (trend confirmation filter)
-        2. RSI(14) crosses upward through 35:
-           - Preceding finalized candle (df.iloc[-3]) RSI <= 35.0
-           - Last finalized candle (df.iloc[-2]) RSI > 35.0
+        1. Last Finalized Close (df.iloc[-2]) > Finalized EMA (df.iloc[-2]) (trend confirmation filter)
+        2. RSI(14) crosses upward through rsi_threshold:
+           - Preceding finalized candle (df.iloc[-3]) RSI <= rsi_threshold
+           - Last finalized candle (df.iloc[-2]) RSI > rsi_threshold
 
     Args:
         df: Pandas DataFrame with OHLCV data. If 'rsi' or 'ema' columns are not present,
             they will be calculated automatically.
+        rsi_threshold: RSI threshold for oversold crossover (default: 35.0).
+        ema_period: EMA lookback period for trend filter (default: 200).
 
     Returns:
         bool: True if entry conditions are strictly met on completed candles; False otherwise.
@@ -177,7 +219,7 @@ def check_entry_signal(df: pd.DataFrame) -> bool:
 
     # Ensure indicators exist
     if "rsi" not in df.columns or "ema" not in df.columns:
-        calculate_indicators(df)
+        calculate_indicators(df, ema_period=ema_period)
 
     # Resolve close column
     close_col = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
@@ -202,18 +244,20 @@ def check_entry_signal(df: pd.DataFrame) -> bool:
         return False
 
     # Evaluation strictly on finalized bar
-    rsi_crossed_up = (float(prev_rsi) <= 35.0) and (float(curr_rsi) > 35.0)
+    rsi_crossed_up = (float(prev_rsi) <= rsi_threshold) and (float(curr_rsi) > rsi_threshold)
     above_trend = float(curr_close) > float(curr_ema)
 
     signal = bool(rsi_crossed_up and above_trend)
 
     if signal:
         logger.info(
-            "[ENTRY SIGNAL TRIGGERED] Closed Candle Close=$%.4f > EMA(200)=$%.4f | RSI(14) crossed up: %.2f -> %.2f (Threshold 35)",
+            "[ENTRY SIGNAL TRIGGERED] Closed Candle Close=$%.4f > EMA(%d)=$%.4f | RSI(14) crossed up: %.2f -> %.2f (Threshold %g)",
             curr_close,
+            ema_period,
             curr_ema,
             prev_rsi,
             curr_rsi,
+            rsi_threshold,
         )
 
     return signal
@@ -223,20 +267,47 @@ async def scan_universe_for_signals(
     exchange: Any,
     universe: List[str],
     timeframe: str = "15m",
-) -> List[Candidate]:
-    """Scan screened universe pairs concurrently using asyncio.gather.
+    rsi_threshold: Optional[float] = None,
+    ema_period: Optional[int] = None,
+) -> CandidateList:
+    """Scan screened universe pairs concurrently using asyncio.gather with diagnostic logging.
 
     Checks entry conditions strictly on completed candle (iloc[-2]):
-    - Close > EMA(200) (trend filter)
-    - RSI(14) upward crossover through 35 (iloc[-3] <= 35.0 and iloc[-2] > 35.0)
+    - Close > EMA (trend filter)
+    - RSI(14) upward crossover through rsi_threshold (iloc[-3] <= threshold and iloc[-2] > threshold)
+
+    Logs compact diagnostic summaries for evaluated candidates:
+    - [SCAN DIAGNOSTICS] {N} pairs evaluated:
+      • BTC/USDT: Price $64,120 < EMA $64,800 [REJECT: Below EMA100]
+      • ETH/USDT: Price $2,640 > EMA $2,580 | RSI 52.4 [REJECT: RSI not crossing 38]
+      • SOL/USDT: Price $152 > EMA $148 | RSI 36.1 (was 32.4) [PASS: Signal Found]
+    - If no pairs trigger: [SCAN RESULT] 0/{N} passed entry criteria. Maintaining 100% Cash.
 
     Returns:
-        List[Candidate]: Matching candidate pairs sorted descending by RSI bounce strength or 24h volume.
+        CandidateList: Matching candidate pairs sorted descending by RSI bounce strength.
     """
     if not universe:
-        return []
+        return CandidateList([], diagnostics=[], summary="[SCAN DIAGNOSTICS] 0 pairs evaluated:\n[SCAN RESULT] 0/0 passed entry criteria. Maintaining 100% Cash.")
 
-    async def _evaluate_symbol(symbol: str) -> Optional[Candidate]:
+    # Resolve sensitivity calibration parameters
+    cfg = getattr(exchange, "config", None)
+    is_real_config = isinstance(cfg, Config)
+
+    if rsi_threshold is not None:
+        effective_rsi_threshold = float(rsi_threshold)
+    elif is_real_config and hasattr(cfg, "rsi_oversold_threshold"):
+        effective_rsi_threshold = float(cfg.rsi_oversold_threshold)
+    else:
+        effective_rsi_threshold = 35.0
+
+    if ema_period is not None:
+        effective_ema_period = int(ema_period)
+    elif is_real_config and hasattr(cfg, "ema_period"):
+        effective_ema_period = int(cfg.ema_period)
+    else:
+        effective_ema_period = 200
+
+    async def _evaluate_symbol(symbol: str) -> Tuple[Optional[Candidate], Dict[str, Any]]:
         try:
             if hasattr(exchange, "fetch_ohlcv_dataframe"):
                 df = await exchange.fetch_ohlcv_dataframe(symbol, timeframe=timeframe, limit=250)
@@ -246,17 +317,20 @@ async def scan_universe_for_signals(
                 for col in ["open", "high", "low", "close", "volume"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             else:
-                return None
+                line = f"• {symbol}: [REJECT: No OHLCV data interface]"
+                return None, {"symbol": symbol, "passed": False, "line": line}
 
             if df is None or len(df) < 3:
-                return None
+                line = f"• {symbol}: [REJECT: Insufficient candle history]"
+                return None, {"symbol": symbol, "passed": False, "line": line}
 
             close_col = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
             if close_col is None:
-                return None
+                line = f"• {symbol}: [REJECT: Missing close column]"
+                return None, {"symbol": symbol, "passed": False, "line": line}
 
             if "rsi" not in df.columns or "ema" not in df.columns:
-                calculate_indicators(df)
+                calculate_indicators(df, ema_period=effective_ema_period)
 
             prev_rsi = df["rsi"].iloc[-3]
             curr_rsi = df["rsi"].iloc[-2]
@@ -269,52 +343,123 @@ async def scan_universe_for_signals(
                 or pd.isna(curr_close)
                 or pd.isna(curr_ema)
             ):
-                return None
+                line = f"• {symbol}: [REJECT: Incomplete indicator warmup]"
+                return None, {"symbol": symbol, "passed": False, "line": line}
 
-            rsi_crossed_up = (float(prev_rsi) <= 35.0) and (float(curr_rsi) > 35.0)
-            above_trend = float(curr_close) > float(curr_ema)
+            curr_close_f = float(curr_close)
+            curr_ema_f = float(curr_ema)
+            curr_rsi_f = float(curr_rsi)
+            prev_rsi_f = float(prev_rsi)
 
-            if rsi_crossed_up and above_trend:
+            price_str = format_price(curr_close_f)
+            ema_str = format_price(curr_ema_f)
+            thresh_str = f"{effective_rsi_threshold:g}"
+
+            above_trend = curr_close_f > curr_ema_f
+            rsi_crossed_up = (prev_rsi_f <= effective_rsi_threshold) and (curr_rsi_f > effective_rsi_threshold)
+
+            if not above_trend:
+                line = f"• {symbol}: Price {price_str} < EMA {ema_str} [REJECT: Below EMA{effective_ema_period}]"
+                return None, {
+                    "symbol": symbol,
+                    "passed": False,
+                    "close": curr_close_f,
+                    "ema": curr_ema_f,
+                    "rsi": curr_rsi_f,
+                    "prev_rsi": prev_rsi_f,
+                    "line": line,
+                }
+            elif not rsi_crossed_up:
+                line = f"• {symbol}: Price {price_str} > EMA {ema_str} | RSI {curr_rsi_f:.1f} [REJECT: RSI not crossing {thresh_str}]"
+                return None, {
+                    "symbol": symbol,
+                    "passed": False,
+                    "close": curr_close_f,
+                    "ema": curr_ema_f,
+                    "rsi": curr_rsi_f,
+                    "prev_rsi": prev_rsi_f,
+                    "line": line,
+                }
+            else:
+                line = f"• {symbol}: Price {price_str} > EMA {ema_str} | RSI {curr_rsi_f:.1f} (was {prev_rsi_f:.1f}) [PASS: Signal Found]"
                 vol = (
                     float(df["volume"].iloc[-2])
                     if "volume" in df.columns and not pd.isna(df["volume"].iloc[-2])
                     else 0.0
                 )
-                bounce = float(curr_rsi) - float(prev_rsi)
+                bounce = curr_rsi_f - prev_rsi_f
                 candidate = Candidate(
                     symbol=symbol,
-                    close=float(curr_close),
-                    ema=float(curr_ema),
-                    rsi=float(curr_rsi),
-                    prev_rsi=float(prev_rsi),
+                    close=curr_close_f,
+                    ema=curr_ema_f,
+                    rsi=curr_rsi_f,
+                    prev_rsi=prev_rsi_f,
                     rsi_bounce=round(bounce, 4),
                     volume=vol,
-                    quote_volume=vol * float(curr_close),
+                    quote_volume=vol * curr_close_f,
                 )
                 logger.info(
                     "[CANDIDATE FOUND] %s: Close=$%.4f > EMA=$%.4f | RSI %.2f -> %.2f (bounce: +%.2f) | Vol: %.2f",
                     symbol,
-                    curr_close,
-                    curr_ema,
-                    prev_rsi,
-                    curr_rsi,
+                    curr_close_f,
+                    curr_ema_f,
+                    prev_rsi_f,
+                    curr_rsi_f,
                     bounce,
                     vol,
                 )
-                return candidate
-            return None
+                return candidate, {
+                    "symbol": symbol,
+                    "passed": True,
+                    "close": curr_close_f,
+                    "ema": curr_ema_f,
+                    "rsi": curr_rsi_f,
+                    "prev_rsi": prev_rsi_f,
+                    "line": line,
+                }
+
         except Exception as e:
             logger.debug("Error scanning signals for candidate %s: %s", symbol, e)
-            return None
+            line = f"• {symbol}: [REJECT: Scan error: {e}]"
+            return None, {"symbol": symbol, "passed": False, "line": line}
 
     tasks = [_evaluate_symbol(sym) for sym in universe]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    candidates: List[Candidate] = [
-        res for res in results
-        if res is not None and not isinstance(res, Exception)
-    ]
+    candidates: List[Candidate] = []
+    diagnostics: List[Dict[str, Any]] = []
+
+    for res in results:
+        if isinstance(res, Exception):
+            logger.debug("Evaluation task exception: %s", res)
+            continue
+        if res is not None:
+            cand, diag = res
+            if diag:
+                diagnostics.append(diag)
+            if cand:
+                candidates.append(cand)
 
     # Sort descending by RSI bounce strength (and secondary by volume)
     candidates.sort(key=lambda c: (c.rsi_bounce, c.volume), reverse=True)
-    return candidates
+
+    # Diagnostic Scan Logging:
+    total_evaluated = len(diagnostics)
+    logger.info("[SCAN DIAGNOSTICS] %d pairs evaluated:", total_evaluated)
+    for diag in diagnostics:
+        logger.info("%s", diag["line"])
+
+    if not candidates:
+        logger.info(f"[SCAN RESULT] 0/{total_evaluated} passed entry criteria. Maintaining 100% Cash.")
+    else:
+        logger.info(f"[SCAN RESULT] {len(candidates)}/{total_evaluated} passed entry criteria.")
+
+    summary_lines = [f"[SCAN DIAGNOSTICS] {total_evaluated} pairs evaluated:"]
+    summary_lines.extend(d["line"] for d in diagnostics)
+    if not candidates:
+        summary_lines.append(f"[SCAN RESULT] 0/{total_evaluated} passed entry criteria. Maintaining 100% Cash.")
+    else:
+        summary_lines.append(f"[SCAN RESULT] {len(candidates)}/{total_evaluated} passed entry criteria.")
+    summary_str = "\n".join(summary_lines)
+
+    return CandidateList(candidates, diagnostics=diagnostics, summary=summary_str)

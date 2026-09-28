@@ -92,6 +92,17 @@ class Config(BaseSettings):
         ge=0,
         description="Cooldown sleep duration in minutes after a position is closed before scanning for re-entry",
     )
+    rsi_oversold_threshold: float = Field(
+        default=38.0,
+        ge=1.0,
+        le=99.0,
+        description="RSI oversold entry threshold (default 38.0 to catch shallow pullbacks)",
+    )
+    ema_period: int = Field(
+        default=100,
+        ge=1,
+        description="EMA trend filter lookback period (default 100 for faster responsiveness)",
+    )
     entry_price: Optional[float] = Field(
         default=None,
         description="Initial position cost basis. If None, captures initial market price at launch",
@@ -232,6 +243,20 @@ class Config(BaseSettings):
     def validate_confidence(cls, v: float) -> float:
         if not (0.0 <= v <= 1.0):
             raise ValueError(f"panic_sell_confidence_threshold must be between 0.0 and 1.0, got {v}")
+        return v
+
+    @field_validator("rsi_oversold_threshold")
+    @classmethod
+    def validate_rsi_threshold(cls, v: float) -> float:
+        if not (0.0 < v < 100.0):
+            raise ValueError(f"RSI_OVERSOLD_THRESHOLD must be between 0 and 100, got {v}")
+        return v
+
+    @field_validator("ema_period")
+    @classmethod
+    def validate_ema_period(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"EMA_PERIOD must be positive, got {v}")
         return v
 
     @model_validator(mode="after")

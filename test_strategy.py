@@ -351,7 +351,7 @@ async def test_fsm_cash_scanning_to_entering_transition():
     df.loc[df.index[-2], "close"] = 152.0
     calculate_indicators(df)
     df.loc[df.index[-3], "rsi"] = 34.0
-    df.loc[df.index[-2], "rsi"] = 36.5
+    df.loc[df.index[-2], "rsi"] = 39.5
     df.loc[df.index[-2], "ema"] = 150.0
 
     bot.exchange.set_mock_ohlcv(df)
@@ -396,7 +396,7 @@ async def test_fsm_ai_veto_blocks_entering_transition():
     df = make_mean_reverting_dataframe(n=220, mean_price=150.0)
     calculate_indicators(df)
     df.loc[df.index[-3], "rsi"] = 34.0
-    df.loc[df.index[-2], "rsi"] = 37.0
+    df.loc[df.index[-2], "rsi"] = 39.5
     df.loc[df.index[-2], "close"] = 155.0
     df.loc[df.index[-2], "ema"] = 150.0
     bot.exchange.set_mock_ohlcv(df)
@@ -502,7 +502,7 @@ async def test_fsm_complete_lifecycle_cycle():
     df = make_mean_reverting_dataframe(n=220, mean_price=100.0)
     calculate_indicators(df)
     df.loc[df.index[-3], "rsi"] = 33.0
-    df.loc[df.index[-2], "rsi"] = 37.0
+    df.loc[df.index[-2], "rsi"] = 39.5
     df.loc[df.index[-2], "close"] = 105.0
     df.loc[df.index[-2], "ema"] = 100.0
     bot.exchange.set_mock_ohlcv(df)
