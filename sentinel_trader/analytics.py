@@ -415,6 +415,124 @@ def parse_trade_timestamp(ts_val: Any) -> Optional[datetime]:
     return None
 
 
+def calculate_drawdown_multiplier(trades: List[Dict[str, Any]]) -> float:
+    """Calculate dynamic risk multiplier based on trade history drawdown ladder.
+
+    Drawdown ladder rules:
+    - 0 or 1 loss: Multiplier = 1.0x (Risk = 1.0% equity)
+    - 2 consecutive losses: Multiplier = 0.5x (Risk cuts to 0.5% equity)
+    - 3+ consecutive losses: Multiplier = 0.25x (Risk cuts to 0.25% equity floor)
+    - 2 consecutive wins: Restores Multiplier step-wise up to 1.0x (e.g. 0.25 -> 0.5 -> 1.0)
+    """
+    multiplier = 1.0
+    cons_losses = 0
+    cons_wins = 0
+
+    for t in trades:
+        pnl = float(t.get("realized_pnl_usd", t.get("pnl_usd", t.get("pnl", 0.0))))
+        if pnl == 0.0 and "realized_pnl_pct" in t:
+            pnl = float(t["realized_pnl_pct"])
+
+        if pnl < 0.0:
+            cons_losses += 1
+            cons_wins = 0
+            if cons_losses >= 3:
+                multiplier = 0.25
+            elif cons_losses == 2:
+                multiplier = min(multiplier, 0.5)
+            else:
+                multiplier = min(multiplier, 1.0)
+        elif pnl > 0.0:
+            cons_wins += 1
+            cons_losses = 0
+            if cons_wins >= 2 and cons_wins % 2 == 0:
+                if multiplier == 0.25:
+                    multiplier = 0.5
+                elif multiplier == 0.5:
+                    multiplier = 1.0
+        else:
+            # Flat/scratch trade with exactly 0 PnL
+            pass
+
+    return multiplier
+
+
+def get_current_streak(
+    window: int = 10,
+    file_path: Optional[str] = None,
+    config: Optional[Any] = None,
+    trades: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Calculate rolling streak metrics and dynamic risk multiplier.
+
+    Args:
+        window: Lookback window of closed trades for rolling win rate calculation (default 10).
+        file_path: Optional path override for trade history JSON file.
+        config: Optional configuration object or boolean (to isolate mock runs).
+        trades: Optional pre-loaded list of trade dictionaries.
+
+    Returns:
+        Dict[str, Any]:
+            - consecutive_losses: int (current count of consecutive losing trades)
+            - consecutive_wins: int (current count of consecutive winning trades)
+            - rolling_win_rate: float (win rate over the last `window` trades, 0.0 to 1.0)
+            - risk_multiplier: float (1.0, 0.5, or 0.25 based on drawdown ladder)
+    """
+    if trades is None:
+        trades = load_trades(file_path=file_path, config=config)
+
+    if not trades:
+        return {
+            "consecutive_losses": 0,
+            "consecutive_wins": 0,
+            "rolling_win_rate": 0.0,
+            "risk_multiplier": 1.0,
+        }
+
+    # 1. Determine active consecutive loss or win streak from most recent trades backwards
+    consecutive_losses = 0
+    consecutive_wins = 0
+
+    for t in reversed(trades):
+        pnl = float(t.get("realized_pnl_usd", t.get("pnl_usd", t.get("pnl", 0.0))))
+        if pnl == 0.0 and "realized_pnl_pct" in t:
+            pnl = float(t["realized_pnl_pct"])
+
+        if pnl < 0.0:
+            if consecutive_wins > 0:
+                break
+            consecutive_losses += 1
+        elif pnl > 0.0:
+            if consecutive_losses > 0:
+                break
+            consecutive_wins += 1
+        else:
+            break
+
+    # 2. Determine rolling win rate over recent window
+    eff_window = window if window > 0 else 10
+    recent_trades = trades[-eff_window:]
+    win_count = 0
+    for t in recent_trades:
+        pnl = float(t.get("realized_pnl_usd", t.get("pnl_usd", t.get("pnl", 0.0))))
+        if pnl == 0.0 and "realized_pnl_pct" in t:
+            pnl = float(t["realized_pnl_pct"])
+        if pnl > 0.0:
+            win_count += 1
+
+    rolling_win_rate = round(win_count / len(recent_trades), 4) if recent_trades else 0.0
+
+    # 3. Determine drawdown ladder risk multiplier
+    risk_multiplier = calculate_drawdown_multiplier(trades)
+
+    return {
+        "consecutive_losses": consecutive_losses,
+        "consecutive_wins": consecutive_wins,
+        "rolling_win_rate": rolling_win_rate,
+        "risk_multiplier": risk_multiplier,
+    }
+
+
 def calculate_metrics(
     free_usdt: float,
     active_positions: Dict[str, Any],
@@ -520,6 +638,8 @@ def calculate_metrics(
     # Format active slots
     active_count = len(active_positions) if active_positions else 0
 
+    streak_info = get_current_streak(file_path=file_path, config=config, trades=trades)
+
     return {
         "total_trades": total_trades,
         "wins": wins,
@@ -535,4 +655,9 @@ def calculate_metrics(
         "active_positions": active_positions or {},
         "active_slots_count": active_count,
         "max_slots": max_slots,
+        "consecutive_losses": streak_info["consecutive_losses"],
+        "consecutive_wins": streak_info["consecutive_wins"],
+        "rolling_win_rate": streak_info["rolling_win_rate"],
+        "risk_multiplier": streak_info["risk_multiplier"],
+        "streak": streak_info,
     }

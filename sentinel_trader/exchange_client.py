@@ -273,11 +273,12 @@ class ExchangeClient:
         atr: float,
         portfolio_risk_per_trade_pct: Optional[float] = None,
         atr_sl_multiplier: Optional[float] = None,
+        trade_history_file: Optional[str] = None,
     ) -> float:
-        """Calculate position sizing via Fixed Fractional Risk / Volatility Parity.
+        """Calculate position sizing via Fixed Fractional Risk / Volatility Parity with Drawdown Ladder Adaptation.
 
         stop_distance = atr * config.atr_sl_multiplier
-        dollar_risk = total_equity * config.portfolio_risk_per_trade_pct
+        dollar_risk = total_equity * effective_risk_pct
         target_quantity = dollar_risk / stop_distance
         # Cap maximum slot allocation to 33% of free USDT to prevent over-allocation on low-vol assets
         max_slot_usdt = free_usdt * 0.33
@@ -286,11 +287,26 @@ class ExchangeClient:
         if free_usdt <= 0.0 or entry_price <= 0.0:
             return 0.0
 
-        risk_pct = (
-            portfolio_risk_per_trade_pct
-            if portfolio_risk_per_trade_pct is not None
-            else getattr(self.config, "portfolio_risk_per_trade_pct", 0.01)
-        )
+        if portfolio_risk_per_trade_pct is not None:
+            risk_pct = portfolio_risk_per_trade_pct
+        else:
+            from sentinel_trader.analytics import get_current_streak
+
+            streak_data = get_current_streak(file_path=trade_history_file, config=self.config)
+            mult = float(streak_data.get("risk_multiplier", 1.0))
+            losses = int(streak_data.get("consecutive_losses", 0))
+
+            base_risk = getattr(self.config, "base_risk_per_trade_pct", getattr(self.config, "portfolio_risk_per_trade_pct", 0.01))
+            min_risk = getattr(self.config, "min_risk_per_trade_pct", 0.0025)
+            risk_pct = max(base_risk * mult, min_risk)
+
+            logger.info(
+                "[RISK ADAPTATION] Streak: %dL | Multiplier: %sx | Sizing Risk: %.2f%%",
+                losses,
+                mult,
+                risk_pct * 100,
+            )
+
         sl_multiplier = (
             atr_sl_multiplier
             if atr_sl_multiplier is not None

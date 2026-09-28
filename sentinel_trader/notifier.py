@@ -219,7 +219,20 @@ class DiscordNotifier:
         free_usdt = float(metrics.get("free_usdt", 0.0))
         value_usdt = f"${free_usdt:,.2f}"
 
-        # 6. Active Slots (X/3): Bulleted list of open coins and unrealized PnL, or 100% Cash
+        # 6. Risk Mode & Current Streak
+        risk_mult = float(metrics.get("risk_multiplier", 1.0))
+        if risk_mult == 0.5:
+            risk_mode_val = "0.5x (Defensive)"
+        elif risk_mult <= 0.25:
+            risk_mode_val = "0.25x (Capital Preservation)"
+        else:
+            risk_mode_val = "1.0x (Normal)"
+
+        cons_losses = int(metrics.get("consecutive_losses", 0))
+        cons_wins = int(metrics.get("consecutive_wins", 0))
+        streak_str = f"{cons_losses}L" if cons_losses > 0 else (f"{cons_wins}W" if cons_wins > 0 else "0L")
+
+        # 7. Active Slots (X/3): Bulleted list of open coins and unrealized PnL, or 100% Cash
         active_slots = metrics.get("active_positions", {})
         active_count = int(metrics.get("active_slots_count", len(active_slots)))
         max_slots = int(metrics.get("max_slots", 3))
@@ -259,6 +272,8 @@ class DiscordNotifier:
             {"name": "Past 1-Hour PnL", "value": value_1h, "inline": True},
             {"name": "Win Rate", "value": value_win_rate, "inline": True},
             {"name": "Free USDT", "value": value_usdt, "inline": True},
+            {"name": "Risk Mode", "value": risk_mode_val, "inline": True},
+            {"name": "Streak", "value": streak_str, "inline": True},
             {"name": slot_title, "value": value_slots, "inline": False},
         ]
 

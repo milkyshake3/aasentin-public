@@ -199,6 +199,9 @@ async def main() -> int:
     assert "66.7% (2W / 1L across 3 trades)" in field_map["Win Rate"]
     assert "Free USDT" in field_map
     assert "$2,450.50" in field_map["Free USDT"]
+    assert "Risk Mode" in field_map
+    assert field_map["Risk Mode"] == "1.0x (Normal)"
+    assert "Streak" in field_map
     assert "Active Slots (2/3)" in field_map
     assert "SOL/USDT" in field_map["Active Slots (2/3)"]
     assert "AVAX/USDT" in field_map["Active Slots (2/3)"]

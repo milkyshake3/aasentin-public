@@ -330,11 +330,12 @@ def test_risk_engine_independent_slot_tp_sl():
 
 
 @pytest.mark.asyncio
-async def test_risk_engine_global_macro_breaker_all_slots():
+async def test_risk_engine_global_macro_breaker_all_slots(tmp_path):
     """Verify Global Macro Breaker liquidates ALL active slots simultaneously on systemic news."""
+    hist_file = str(tmp_path / "trade_history_macro.json")
     config = Config(mock_exchange=True)
     exchange = ExchangeClient(config)
-    risk = RiskEngine(config, exchange)
+    risk = RiskEngine(config, exchange, trade_history_file=hist_file)
 
     # Setup 3 active slots
     risk.open_position("SOL/USDT", entry_price=150.0, amount=10.0)
@@ -577,15 +578,16 @@ def test_chandelier_stop_ratchet_up_never_down():
     assert trigger5 == TriggerReason.CHANDELIER_STOP
 
 
-def test_volatility_parity_sizing_high_vs_low_atr():
+def test_volatility_parity_sizing_high_vs_low_atr(tmp_path):
     """Verify Volatility Parity sizing: high ATR generates strictly smaller sizing than low ATR."""
+    hist_file = str(tmp_path / "trade_history_vol.json")
     config = Config(
         mock_exchange=True,
         portfolio_risk_per_trade_pct=0.01,  # 1% equity risk
         atr_sl_multiplier=1.5,
     )
     exchange = ExchangeClient(config)
-    risk = RiskEngine(config, exchange)
+    risk = RiskEngine(config, exchange, trade_history_file=hist_file)
 
     free_usdt = 10000.0
     total_equity = 10000.0
@@ -625,6 +627,7 @@ def test_volatility_parity_sizing_high_vs_low_atr():
         free_usdt=free_usdt,
         entry_price=entry_price,
         atr=5.0,
+        trade_history_file=hist_file,
     )
     assert ec_cost_high == pytest.approx(cost_high_atr, abs=1e-4)
 

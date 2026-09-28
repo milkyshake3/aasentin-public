@@ -123,6 +123,18 @@ class Config(BaseSettings):
         le=0.20,
         description="Fixed Fractional Risk: fraction of total portfolio equity risked per trade (default 0.01 = 1.0%)",
     )
+    base_risk_per_trade_pct: float = Field(
+        default=0.01,
+        ge=0.0001,
+        le=0.20,
+        description="Base Risk Per Trade: Base fraction of total portfolio equity risked per trade (default 0.01 = 1.0%)",
+    )
+    min_risk_per_trade_pct: float = Field(
+        default=0.0025,
+        ge=0.0001,
+        le=0.10,
+        description="Minimum Risk Per Trade: Floor fraction of total portfolio equity risked per trade (default 0.0025 = 0.25%)",
+    )
     atr_sl_multiplier: float = Field(
         default=1.5,
         gt=0.0,
@@ -276,6 +288,13 @@ class Config(BaseSettings):
             raise ValueError(f"EMA_PERIOD must be positive, got {v}")
         return v
 
+    @field_validator("base_risk_per_trade_pct", "min_risk_per_trade_pct")
+    @classmethod
+    def validate_risk_pct(cls, v: float) -> float:
+        if not (0.0 < v < 1.0):
+            raise ValueError(f"Risk percentage must be between 0.0 and 1.0, got {v}")
+        return v
+
     @model_validator(mode="after")
     def enforce_sandbox_safety(self) -> "Config":
         """Safety Invariant: Prevent accidental live trading without explicit double confirmation."""
@@ -284,6 +303,11 @@ class Config(BaseSettings):
                 "CRITICAL SAFETY VIOLATION: BINANCE_SANDBOX is False but ALLOW_PRODUCTION_TRADING is not True. "
                 "Sentinel-Trader requires explicit environment confirmation to trade on live mainnet!"
             )
+        # Keep base_risk_per_trade_pct and portfolio_risk_per_trade_pct synchronized
+        if self.portfolio_risk_per_trade_pct != 0.01 and self.base_risk_per_trade_pct == 0.01:
+            self.base_risk_per_trade_pct = self.portfolio_risk_per_trade_pct
+        elif self.base_risk_per_trade_pct != 0.01 and self.portfolio_risk_per_trade_pct == 0.01:
+            self.portfolio_risk_per_trade_pct = self.base_risk_per_trade_pct
         return self
 
     @property

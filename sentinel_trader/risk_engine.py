@@ -257,41 +257,108 @@ class RiskEngine:
         """Check if portfolio has an open slot under MAX_ACTIVE_POSITIONS."""
         return len(self.active_positions) < self.max_active_positions
 
+    def calculate_volatility_parity_sizing(
+        self,
+        free_usdt: Optional[float] = None,
+        atr: Optional[float] = None,
+        entry_price: Optional[float] = None,
+        total_equity: Optional[float] = None,
+        trade_history_file: Optional[str] = None,
+        portfolio_risk_per_trade_pct: Optional[float] = None,
+        atr_sl_multiplier: Optional[float] = None,
+        **kwargs: Any,
+    ) -> float:
+        """Calculate position sizing via Fixed Fractional Risk / Volatility Parity with Drawdown Ladder Adaptation.
+
+        Queries trade analytics for current streak and scales effective risk:
+            effective_risk_pct = config.base_risk_per_trade_pct * streak_data["risk_multiplier"]
+            dollar_risk = total_equity * effective_risk_pct
+        """
+        # Flexible parameter resolution for varying caller conventions
+        if "total_equity" in kwargs and total_equity is None:
+            total_equity = kwargs.pop("total_equity")
+        if "free_usdt" in kwargs and free_usdt is None:
+            free_usdt = kwargs.pop("free_usdt")
+        if "entry_price" in kwargs and entry_price is None:
+            entry_price = kwargs.pop("entry_price")
+        if "atr" in kwargs and atr is None:
+            atr = kwargs.pop("atr")
+
+        # Detect if called as (total_equity, free_usdt, entry_price, atr) positionally
+        if total_equity is not None and atr is not None and free_usdt is not None:
+            if total_equity < atr and free_usdt > atr:
+                total_equity, free_usdt, entry_price, atr = free_usdt, total_equity, entry_price, atr
+
+        if free_usdt is None or free_usdt <= 0.0 or entry_price is None or entry_price <= 0.0 or atr is None or atr <= 0.0:
+            return 0.0
+
+        from sentinel_trader.analytics import get_current_streak
+
+        hist_file = trade_history_file or self.trade_history_file
+        streak_data = get_current_streak(file_path=hist_file, config=self.config)
+
+        mult = float(streak_data.get("risk_multiplier", 1.0))
+        losses = int(streak_data.get("consecutive_losses", 0))
+
+        base_risk = (
+            portfolio_risk_per_trade_pct
+            if portfolio_risk_per_trade_pct is not None
+            else getattr(self.config, "base_risk_per_trade_pct", getattr(self.config, "portfolio_risk_per_trade_pct", 0.01))
+        )
+        min_risk = getattr(self.config, "min_risk_per_trade_pct", 0.0025)
+
+        effective_risk_pct = base_risk * mult
+        effective_risk_pct = max(effective_risk_pct, min_risk)
+
+        equity = total_equity if (total_equity is not None and total_equity > 0) else free_usdt
+        dollar_risk = equity * effective_risk_pct
+
+        logger.info(
+            "[RISK ADAPTATION] Streak: %dL | Multiplier: %sx | Sizing Risk: %.2f%%",
+            losses,
+            mult,
+            effective_risk_pct * 100,
+        )
+
+        sl_multiplier = (
+            atr_sl_multiplier
+            if atr_sl_multiplier is not None
+            else getattr(self.config, "atr_sl_multiplier", 1.5)
+        )
+        stop_distance = atr * sl_multiplier
+        if stop_distance <= 0:
+            return 0.0
+
+        target_quantity = dollar_risk / stop_distance
+        max_slot_usdt = free_usdt * 0.33
+        cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+        return cost_usdt
+
     def calculate_slot_size(
         self,
         free_usdt: float,
         atr: Optional[float] = None,
         entry_price: Optional[float] = None,
         total_equity: Optional[float] = None,
+        trade_history_file: Optional[str] = None,
     ) -> float:
         """Determine position allocation sizing.
 
-        When atr and entry_price are supplied, uses Volatility Parity Fixed Fractional Risk sizing:
-            stop_distance = atr * config.atr_sl_multiplier
-            dollar_risk = total_equity * config.portfolio_risk_per_trade_pct
-            target_quantity = dollar_risk / stop_distance
-            # Cap maximum slot allocation to 33% of free USDT to prevent over-allocation on low-vol assets
-            max_slot_usdt = free_usdt * 0.33
-            cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
+        When atr and entry_price are supplied, uses Volatility Parity Fixed Fractional Risk sizing
+        with Streak-Based Adaptive Risk Scaling (Drawdown Ladder).
         Otherwise, falls back to legacy slot allocation (SLOT_ALLOCATION_PCT = 0.25, min $15).
         """
         if free_usdt < 15.0:
             return 0.0
 
         if atr is not None and entry_price is not None and atr > 0 and entry_price > 0:
-            equity = total_equity if (total_equity is not None and total_equity > 0) else free_usdt
-            risk_pct = getattr(self.config, "portfolio_risk_per_trade_pct", 0.01)
-            sl_multiplier = getattr(self.config, "atr_sl_multiplier", 1.5)
-
-            stop_distance = atr * sl_multiplier
-            if stop_distance <= 0:
-                return 0.0
-
-            dollar_risk = equity * risk_pct
-            target_quantity = dollar_risk / stop_distance
-            max_slot_usdt = free_usdt * 0.33
-            cost_usdt = min(target_quantity * entry_price, max_slot_usdt)
-            return cost_usdt
+            return self.calculate_volatility_parity_sizing(
+                free_usdt=free_usdt,
+                atr=atr,
+                entry_price=entry_price,
+                total_equity=total_equity,
+                trade_history_file=trade_history_file,
+            )
 
         allocated = free_usdt * self.slot_allocation_pct
         return max(allocated, 15.0)
@@ -302,13 +369,15 @@ class RiskEngine:
         atr: float,
         entry_price: float,
         total_equity: Optional[float] = None,
+        trade_history_file: Optional[str] = None,
     ) -> float:
         """Explicitly compute Volatility Parity Position Sizing (Fixed Fractional Risk)."""
-        return self.calculate_slot_size(
+        return self.calculate_volatility_parity_sizing(
             free_usdt=free_usdt,
             atr=atr,
             entry_price=entry_price,
             total_equity=total_equity,
+            trade_history_file=trade_history_file,
         )
 
     def open_position(
