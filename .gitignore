@@ -53,6 +53,7 @@ logs/
 *.db
 state.json
 trade_history.json
+trade_history_mock.json
 order_history/
 news_cache.json
 .cache/

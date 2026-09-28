@@ -418,3 +418,81 @@ def test_check_entry_signal_custom_sensitivity():
 
     # Under higher 40 threshold: False (39.0 is not > 40.0)
     assert check_entry_signal(df, rsi_threshold=40.0, ema_period=100) is False
+
+
+# =====================================================================
+# 4. Transient Exchange Error Retry (-1001) Tests
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_fetch_ohlcv_dataframe_transient_1001_retry_success():
+    """Verify fetch_ohlcv_dataframe retries on Binance -1001 internal server error and succeeds."""
+    config = Config(mock_exchange=False, binance_api_key="k", binance_api_secret="s")
+    client = ExchangeClient(config)
+
+    mock_candles = [
+        [1700000000000 + i * 900000, 100.0 + i, 105.0 + i, 95.0 + i, 102.0 + i, 1000.0]
+        for i in range(10)
+    ]
+
+    mock_data_exchange = AsyncMock()
+    # Attempt 0: fails with Binance -1001; Attempt 1: succeeds
+    mock_data_exchange.fetch_ohlcv = AsyncMock(
+        side_effect=[
+            Exception('binance {"code":-1001,"msg":"Internal error; unable to process your request. Please try again."}'),
+            mock_candles,
+        ]
+    )
+    client.data_exchange = mock_data_exchange
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        df = await client.fetch_ohlcv_dataframe("SOL/USDT", timeframe="15m", limit=10)
+
+        assert not df.empty
+        assert len(df) == 10
+        assert mock_data_exchange.fetch_ohlcv.call_count == 2
+        mock_sleep.assert_awaited_once_with(0.5)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ohlcv_dataframe_transient_1001_retry_exhausted():
+    """Verify fetch_ohlcv_dataframe fails and raises after exhausting 2 retries on -1001."""
+    config = Config(mock_exchange=False, binance_api_key="k", binance_api_secret="s")
+    client = ExchangeClient(config)
+
+    mock_data_exchange = AsyncMock()
+    # 3 failures in a row (initial + 2 retries)
+    mock_data_exchange.fetch_ohlcv = AsyncMock(
+        side_effect=[
+            Exception('{"code":-1001,"msg":"Internal error"}'),
+            Exception('{"code":-1001,"msg":"Internal error"}'),
+            Exception('{"code":-1001,"msg":"Internal error"}'),
+        ]
+    )
+    client.data_exchange = mock_data_exchange
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with pytest.raises(Exception, match="-1001"):
+            await client.fetch_ohlcv_dataframe("SOL/USDT", timeframe="15m", limit=10)
+
+        assert mock_data_exchange.fetch_ohlcv.call_count == 3
+        assert mock_sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_ohlcv_dataframe_non_1001_no_retry():
+    """Verify fetch_ohlcv_dataframe does not retry on non-1001 errors."""
+    config = Config(mock_exchange=False, binance_api_key="k", binance_api_secret="s")
+    client = ExchangeClient(config)
+
+    mock_data_exchange = AsyncMock()
+    mock_data_exchange.fetch_ohlcv = AsyncMock(side_effect=Exception("Invalid symbol SOL/USDT"))
+    client.data_exchange = mock_data_exchange
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with pytest.raises(Exception, match="Invalid symbol"):
+            await client.fetch_ohlcv_dataframe("SOL/USDT", timeframe="15m", limit=10)
+
+        assert mock_data_exchange.fetch_ohlcv.call_count == 1
+        mock_sleep.assert_not_called()
+

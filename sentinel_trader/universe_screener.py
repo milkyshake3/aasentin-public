@@ -8,6 +8,7 @@ Includes an in-memory 24-hour cache (TTL 86,400s) and liquid mock exchange fallb
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -22,7 +23,18 @@ STABLECOIN_BLACKLIST: Set[str] = {
     "DAI/USDT",
     "USDP/USDT",
     "AEUR/USDT",
+    "USD1/USDT",
+    "USDE/USDT",
+    "PYUSD/USDT",
+    "BFUSD/USDT",
+    "USDD/USDT",
 }
+
+# Safety Regex: match any base asset containing "USD" (case-insensitive)
+USD_BASE_REGEX = re.compile(r"USD", re.IGNORECASE)
+
+# Module-level set of explicitly whitelisted USD base assets or symbols
+WHITELISTED_USD_BASE_ASSETS: Set[str] = set()
 
 LEVERAGED_PATTERNS: Tuple[str, ...] = ("UP/", "DOWN/", "BULL/", "BEAR/")
 
@@ -39,8 +51,13 @@ DEFAULT_MOCK_UNIVERSE: List[str] = [
 class UniverseScreener:
     """Dynamic universe screener maintaining a 24-hour in-memory cache."""
 
-    def __init__(self, cache_ttl_seconds: int = 86400):
+    def __init__(
+        self,
+        cache_ttl_seconds: int = 86400,
+        whitelisted_symbols: Optional[Set[str]] = None,
+    ):
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.whitelisted_symbols: Set[str] = set(whitelisted_symbols or set())
         self._cached_universe: Optional[List[str]] = None
         self._cache_timestamp: Optional[float] = None
 
@@ -76,6 +93,7 @@ class UniverseScreener:
         top_n: int = 15,
         mock_exchange: Optional[bool] = None,
         force_refresh: bool = False,
+        whitelisted_symbols: Optional[Set[str]] = None,
     ) -> List[str]:
         """Fetch all 24h tickers in a single call and return top_n pairs by quoteVolume.
 
@@ -83,10 +101,17 @@ class UniverseScreener:
         - Must be an active spot market (market['spot'] is True and market['active'] is True).
         - Symbol must settle in USDT (symbol.endswith('/USDT')).
         - Exclude Blacklisted Stablecoins & Fiat (STABLECOIN_BLACKLIST).
+        - Safety Regex Filter: Exclude symbols containing 'USD' in base asset unless whitelisted.
         - Exclude leveraged tokens (symbols containing UP/, DOWN/, BULL/, BEAR/).
         - Sort remaining pairs descending by ticker['quoteVolume'] (24-hour USDT turnover).
         - Cache result for 24 hours unless force_refresh is True.
         """
+        # Resolve active whitelist for USD base asset safety filter
+        active_whitelist: Set[str] = set(self.whitelisted_symbols)
+        if whitelisted_symbols:
+            active_whitelist.update(whitelisted_symbols)
+        active_whitelist.update(WHITELISTED_USD_BASE_ASSETS)
+
         # 1. Mock exchange support
         is_mock = False
         if mock_exchange is True:
@@ -138,6 +163,17 @@ class UniverseScreener:
             # Exclude Blacklisted Stablecoins & Fiat
             if symbol in STABLECOIN_BLACKLIST:
                 continue
+
+            # Safety Regex Filter: Ignore any symbol containing USD in base asset unless whitelisted
+            base_asset = symbol.split("/")[0] if "/" in symbol else symbol
+            if USD_BASE_REGEX.search(base_asset):
+                if symbol not in active_whitelist and base_asset not in active_whitelist:
+                    logger.debug(
+                        "[UNIVERSE SCREENER] Filtered out %s: base asset '%s' contains 'USD' and is not whitelisted",
+                        symbol,
+                        base_asset,
+                    )
+                    continue
 
             # Exclude leveraged tokens (UP/, DOWN/, BULL/, BEAR/)
             if any(p in symbol for p in LEVERAGED_PATTERNS):
@@ -210,6 +246,7 @@ async def get_dynamic_universe(
     top_n: int = 15,
     mock_exchange: Optional[bool] = None,
     force_refresh: bool = False,
+    whitelisted_symbols: Optional[Set[str]] = None,
 ) -> List[str]:
     """Top-level convenience method matching specification."""
     return await _default_screener.get_dynamic_universe(
@@ -217,4 +254,5 @@ async def get_dynamic_universe(
         top_n=top_n,
         mock_exchange=mock_exchange,
         force_refresh=force_refresh,
+        whitelisted_symbols=whitelisted_symbols,
     )

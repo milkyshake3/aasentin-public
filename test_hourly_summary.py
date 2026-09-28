@@ -42,6 +42,7 @@ if sys.platform == "win32":
 
 from sentinel_trader.analytics import (
     DEFAULT_TRADE_HISTORY_FILE,
+    DEFAULT_MOCK_TRADE_HISTORY_FILE,
     calculate_metrics,
     clear_trades,
     record_trade,
@@ -79,7 +80,7 @@ async def main() -> int:
     print(f" Target Webhook: {masked_url}")
 
     # 2. Generate Realistic Mock Trade Data in trade_history.json
-    trade_file = os.path.join(root_dir, DEFAULT_TRADE_HISTORY_FILE)
+    trade_file = os.path.join(root_dir, DEFAULT_MOCK_TRADE_HISTORY_FILE)
     print(f" Initializing test trade history in: {trade_file}")
     clear_trades(trade_file)
 

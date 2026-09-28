@@ -15,6 +15,33 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("sentinel.analytics")
 
 DEFAULT_TRADE_HISTORY_FILE = "trade_history.json"
+DEFAULT_MOCK_TRADE_HISTORY_FILE = "trade_history_mock.json"
+MOCK_TRADE_HISTORY_FILE = "trade_history_mock.json"
+
+
+def resolve_trade_history_path(
+    file_path: Optional[str] = None,
+    config: Optional[Any] = None,
+) -> str:
+    """Resolve target trade history file, isolating mock/test runs to trade_history_mock.json.
+
+    If config.mock_exchange is True (or mock environment is active), and the caller did
+    not supply an isolated custom file path, defaults to trade_history_mock.json.
+    """
+    is_mock = False
+    if config is not None:
+        if isinstance(config, bool):
+            is_mock = config
+        else:
+            is_mock = bool(getattr(config, "mock_exchange", False))
+    elif os.environ.get("MOCK_EXCHANGE", "").lower() in ("true", "1", "yes") or os.environ.get("SENTINEL_MOCK_EXCHANGE", "").lower() in ("true", "1", "yes"):
+        is_mock = True
+
+    if is_mock:
+        if file_path is None or file_path == DEFAULT_TRADE_HISTORY_FILE or os.path.abspath(file_path) == os.path.abspath(DEFAULT_TRADE_HISTORY_FILE):
+            return DEFAULT_MOCK_TRADE_HISTORY_FILE
+
+    return file_path or DEFAULT_TRADE_HISTORY_FILE
 
 
 def record_trade(
@@ -27,8 +54,9 @@ def record_trade(
     trigger_reason: str,
     file_path: Optional[str] = None,
     timestamp: Optional[str] = None,
+    config: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Atomically record a closed trade into trade_history.json.
+    """Atomically record a closed trade into trade_history.json (or trade_history_mock.json).
 
     Args:
         symbol: Trading pair symbol (e.g. 'SOL/USDT').
@@ -40,11 +68,12 @@ def record_trade(
         trigger_reason: Reason for liquidation (e.g. 'TAKE_PROFIT', 'STOP_LOSS', 'AI_PANIC_SELL').
         file_path: Optional path override for trade history JSON file.
         timestamp: Optional ISO-8601 timestamp string override.
+        config: Optional configuration object or boolean (checks config.mock_exchange).
 
     Returns:
         Dict[str, Any]: The newly recorded trade record dictionary.
     """
-    target_path = file_path or DEFAULT_TRADE_HISTORY_FILE
+    target_path = resolve_trade_history_path(file_path, config)
     target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
     os.makedirs(target_dir, exist_ok=True)
 
@@ -87,16 +116,20 @@ def record_trade(
     return record
 
 
-def load_trades(file_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def load_trades(
+    file_path: Optional[str] = None,
+    config: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """Load historical closed trades from JSON persistence.
 
     Args:
         file_path: Optional path override for trade history JSON file.
+        config: Optional configuration object or boolean (checks config.mock_exchange).
 
     Returns:
         List[Dict[str, Any]]: List of trade records, or empty list if file doesn't exist or is corrupt.
     """
-    target_path = file_path or DEFAULT_TRADE_HISTORY_FILE
+    target_path = resolve_trade_history_path(file_path, config)
     if not os.path.exists(target_path):
         return []
 
@@ -116,16 +149,20 @@ def load_trades(file_path: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
 
-def clear_trades(file_path: Optional[str] = None) -> bool:
+def clear_trades(
+    file_path: Optional[str] = None,
+    config: Optional[Any] = None,
+) -> bool:
     """Clear/remove the trade history file (useful for test resets).
 
     Args:
         file_path: Optional path override for trade history JSON file.
+        config: Optional configuration object or boolean (checks config.mock_exchange).
 
     Returns:
         bool: True if cleared successfully or file was already absent.
     """
-    target_path = file_path or DEFAULT_TRADE_HISTORY_FILE
+    target_path = resolve_trade_history_path(file_path, config)
     if os.path.exists(target_path):
         try:
             os.remove(target_path)
@@ -162,6 +199,7 @@ def calculate_metrics(
     trades: Optional[List[Dict[str, Any]]] = None,
     lookback_minutes: int = 60,
     max_slots: int = 3,
+    config: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Calculate multi-dimensional trading performance metrics.
 
@@ -172,6 +210,7 @@ def calculate_metrics(
         trades: Optional pre-loaded list of trade dictionaries.
         lookback_minutes: Window for rolling PnL calculation (default 60 minutes).
         max_slots: Total available portfolio slot capacity (default 3).
+        config: Optional configuration object or boolean (checks config.mock_exchange).
 
     Returns:
         Dict[str, Any]: Computed performance metrics containing:
@@ -191,7 +230,7 @@ def calculate_metrics(
             - max_slots (int)
     """
     if trades is None:
-        trades = load_trades(file_path)
+        trades = load_trades(file_path, config=config)
 
     total_trades = len(trades)
     wins = 0

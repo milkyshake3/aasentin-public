@@ -11,6 +11,8 @@ Verifies:
 
 import asyncio
 from datetime import datetime, timezone, timedelta
+import json
+import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
@@ -1405,5 +1407,67 @@ async def test_hourly_summary_worker_lifecycle(tmp_path):
 
     await asyncio.gather(shutdown_task, worker_task)
     assert bot._shutdown_event.is_set()
+
+
+# =====================================================================
+# Trade History Isolation & Reset Tests
+# =====================================================================
+
+def test_trade_history_json_empty_baseline():
+    """Verify that root trade_history.json exists and is reset to empty list []."""
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    trade_file = os.path.join(root_dir, "trade_history.json")
+    assert os.path.exists(trade_file)
+    with open(trade_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data == []
+
+
+def test_record_trade_isolates_mock_exchange_to_mock_file(tmp_path, monkeypatch):
+    """Verify record_trade directs mock trades to trade_history_mock.json instead of trade_history.json."""
+    mock_file = str(tmp_path / "trade_history_mock.json")
+    live_file = str(tmp_path / "trade_history.json")
+
+    # Set DEFAULT_TRADE_HISTORY_FILE and DEFAULT_MOCK_TRADE_HISTORY_FILE for this test
+    from sentinel_trader import analytics
+    monkeypatch.setattr(analytics, "DEFAULT_TRADE_HISTORY_FILE", live_file)
+    monkeypatch.setattr(analytics, "DEFAULT_MOCK_TRADE_HISTORY_FILE", mock_file)
+
+    # Initialize live file with empty list
+    with open(live_file, "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+    config_mock = Config(mock_exchange=True)
+    # Record trade with config_mock
+    record_trade(
+        symbol="SOL/USDT",
+        entry_price=100.0,
+        exit_price=110.0,
+        amount=1.0,
+        realized_pnl_usd=10.0,
+        realized_pnl_pct=0.10,
+        trigger_reason="TAKE_PROFIT",
+        config=config_mock,
+    )
+
+    # Live file must remain untouched / empty
+    assert analytics.load_trades(live_file) == []
+
+    # Mock file must contain the trade
+    mock_trades = analytics.load_trades(mock_file)
+    assert len(mock_trades) == 1
+    assert mock_trades[0]["symbol"] == "SOL/USDT"
+
+
+def test_sentinel_trader_trade_history_file_resolution():
+    """Verify SentinelTrader sets trade_history_file according to mock_exchange setting."""
+    config_mock = Config(mock_exchange=True)
+    bot_mock = SentinelTrader(config_mock)
+    assert bot_mock.trade_history_file == "trade_history_mock.json"
+
+    config_live = Config(mock_exchange=False, binance_api_key="k", binance_api_secret="s")
+    bot_live = SentinelTrader(config_live)
+    assert bot_live.trade_history_file == "trade_history.json"
+
 
 

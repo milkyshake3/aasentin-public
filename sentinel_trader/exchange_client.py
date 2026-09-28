@@ -352,22 +352,43 @@ class ExchangeClient:
             return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         client = self.data_exchange or self.order_exchange
-        try:
-            raw_candles = await client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
-            if not raw_candles:
-                logger.warning("Empty OHLCV data received for %s (%s)", sym, timeframe)
-                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        max_retries = 2
+        backoff_seconds = 0.5
+        for attempt in range(max_retries + 1):
+            try:
+                raw_candles = await client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+                if not raw_candles:
+                    logger.warning("Empty OHLCV data received for %s (%s)", sym, timeframe)
+                    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-            df = pd.DataFrame(
-                raw_candles,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df
-        except Exception as e:
-            logger.error("Failed to fetch OHLCV dataframe for %s (%s): %s", sym, timeframe, e)
-            raise
+                df = pd.DataFrame(
+                    raw_candles,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df
+            except Exception as e:
+                # Detect Binance transient error code -1001 (internal server error)
+                is_transient_1001 = (
+                    "-1001" in str(e)
+                    or getattr(e, "code", None) in (-1001, "-1001")
+                    or (isinstance(getattr(e, "args", None), (list, tuple)) and any("-1001" in str(arg) for arg in e.args))
+                )
+                if is_transient_1001 and attempt < max_retries:
+                    logger.warning(
+                        "Transient Binance -1001 internal server error fetching OHLCV for %s (%s). Retrying %d/%d after %.1fs backoff...",
+                        sym,
+                        timeframe,
+                        attempt + 1,
+                        max_retries,
+                        backoff_seconds,
+                    )
+                    await asyncio.sleep(backoff_seconds)
+                    continue
+
+                logger.error("Failed to fetch OHLCV dataframe for %s (%s): %s", sym, timeframe, e)
+                raise
 
     async def liquidate_to_usdt(
         self,

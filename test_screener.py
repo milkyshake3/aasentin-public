@@ -438,3 +438,86 @@ async def test_bot_multi_slot_rehydration(tmp_path):
     assert "ETH/USDT" in bot.risk_engine.active_positions
     assert bot.risk_engine.active_positions["SOL/USDT"].entry_price == 140.0
     assert bot.risk_engine.active_positions["ETH/USDT"].entry_price == 2500.0
+
+
+# =====================================================================
+# 9. Expanded Stablecoin Blacklist & USD Base Regex Filter Tests
+# =====================================================================
+
+def test_screener_expanded_stablecoin_blacklist_constants():
+    """Verify that all required stablecoin tickers are present in STABLECOIN_BLACKLIST."""
+    required_stables = [
+        "USD1/USDT",
+        "USDE/USDT",
+        "PYUSD/USDT",
+        "BFUSD/USDT",
+        "FDUSD/USDT",
+        "USDD/USDT",
+    ]
+    for ticker in required_stables:
+        assert ticker in STABLECOIN_BLACKLIST, f"Missing {ticker} in STABLECOIN_BLACKLIST"
+
+
+@pytest.mark.asyncio
+async def test_screener_usd_base_regex_filtering():
+    """Verify safety regex filter excludes any pair containing 'USD' in base asset unless whitelisted."""
+    mock_exchange = AsyncMock()
+    mock_exchange.is_mock = False
+    mock_exchange.markets = {}
+
+    mock_exchange.fetch_tickers = AsyncMock(
+        return_value={
+            # Stablecoins / USD variants in base asset
+            "USD1/USDT": {"symbol": "USD1/USDT", "quoteVolume": 900000000.0, "spot": True, "active": True},
+            "USDE/USDT": {"symbol": "USDE/USDT", "quoteVolume": 800000000.0, "spot": True, "active": True},
+            "PYUSD/USDT": {"symbol": "PYUSD/USDT", "quoteVolume": 700000000.0, "spot": True, "active": True},
+            "BFUSD/USDT": {"symbol": "BFUSD/USDT", "quoteVolume": 600000000.0, "spot": True, "active": True},
+            "FDUSD/USDT": {"symbol": "FDUSD/USDT", "quoteVolume": 500000000.0, "spot": True, "active": True},
+            "USDD/USDT": {"symbol": "USDD/USDT", "quoteVolume": 400000000.0, "spot": True, "active": True},
+            "NEWUSD/USDT": {"symbol": "NEWUSD/USDT", "quoteVolume": 350000000.0, "spot": True, "active": True},
+            "USDXYZ/USDT": {"symbol": "USDXYZ/USDT", "quoteVolume": 300000000.0, "spot": True, "active": True},
+            # Legitimate assets (quote is USDT, base does not contain USD)
+            "BTC/USDT": {"symbol": "BTC/USDT", "quoteVolume": 200000000.0, "spot": True, "active": True},
+            "ETH/USDT": {"symbol": "ETH/USDT", "quoteVolume": 100000000.0, "spot": True, "active": True},
+            "SOL/USDT": {"symbol": "SOL/USDT", "quoteVolume": 50000000.0, "spot": True, "active": True},
+        }
+    )
+
+    screener = UniverseScreener(cache_ttl_seconds=86400)
+    universe = await screener.get_dynamic_universe(mock_exchange, top_n=10)
+
+    # All USD-base symbols must be excluded
+    excluded = [
+        "USD1/USDT", "USDE/USDT", "PYUSD/USDT", "BFUSD/USDT",
+        "FDUSD/USDT", "USDD/USDT", "NEWUSD/USDT", "USDXYZ/USDT",
+    ]
+    for sym in excluded:
+        assert sym not in universe, f"{sym} should have been excluded by blacklist/regex filter"
+
+    # Only legitimate crypto pairs should remain
+    assert universe == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+
+@pytest.mark.asyncio
+async def test_screener_usd_base_regex_whitelist():
+    """Verify that explicitly whitelisted symbols containing 'USD' in base asset are allowed."""
+    mock_exchange = AsyncMock()
+    mock_exchange.is_mock = False
+    mock_exchange.markets = {}
+
+    mock_exchange.fetch_tickers = AsyncMock(
+        return_value={
+            "WHITELISTEDUSD/USDT": {"symbol": "WHITELISTEDUSD/USDT", "quoteVolume": 500000000.0, "spot": True, "active": True},
+            "NONWHITELISTEDUSD/USDT": {"symbol": "NONWHITELISTEDUSD/USDT", "quoteVolume": 400000000.0, "spot": True, "active": True},
+            "BTC/USDT": {"symbol": "BTC/USDT", "quoteVolume": 300000000.0, "spot": True, "active": True},
+        }
+    )
+
+    screener = UniverseScreener(cache_ttl_seconds=86400, whitelisted_symbols={"WHITELISTEDUSD/USDT"})
+    universe = await screener.get_dynamic_universe(mock_exchange, top_n=10)
+
+    assert "WHITELISTEDUSD/USDT" in universe
+    assert "NONWHITELISTEDUSD/USDT" not in universe
+    assert "BTC/USDT" in universe
+    assert universe == ["WHITELISTEDUSD/USDT", "BTC/USDT"]
+

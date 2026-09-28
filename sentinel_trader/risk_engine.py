@@ -632,6 +632,7 @@ class RiskEngine:
                 realized_pnl_pct=pnl_pct,
                 trigger_reason=trigger.value if hasattr(trigger, "value") else str(trigger),
                 file_path=self.trade_history_file,
+                config=self.config,
             )
         except Exception as e:
             logger.error("Failed to record trade to analytics: %s", e)

@@ -80,7 +80,13 @@ except ImportError:
 
 import pandas as pd
 from sentinel_trader.ai_sentinel import AISentinel, NewsAnalysis
-from sentinel_trader.analytics import DEFAULT_TRADE_HISTORY_FILE, calculate_metrics, record_trade
+from sentinel_trader.analytics import (
+    DEFAULT_TRADE_HISTORY_FILE,
+    DEFAULT_MOCK_TRADE_HISTORY_FILE,
+    calculate_metrics,
+    record_trade,
+    resolve_trade_history_path,
+)
 from sentinel_trader.config import Config
 from sentinel_trader.exchange_client import ExchangeClient
 from sentinel_trader.news_watcher import NewsWatcher, NewsArticle
@@ -149,7 +155,10 @@ class SentinelTrader:
         self.initial_state = initial_state
         self.max_cycles = max_cycles
         self.state_file = state_file or DEFAULT_STATE_FILE
-        self.trade_history_file = trade_history_file or getattr(self.config, "trade_history_file", DEFAULT_TRADE_HISTORY_FILE)
+        self.trade_history_file = trade_history_file or resolve_trade_history_path(
+            getattr(self.config, "trade_history_file", None),
+            config=self.config,
+        )
         self.exchange = ExchangeClient(self.config)
         self.news_watcher = NewsWatcher(self.config)
         self.ai_sentinel = AISentinel(self.config)
