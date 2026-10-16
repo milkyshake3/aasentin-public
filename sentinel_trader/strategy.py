@@ -7,7 +7,7 @@ Provides 100% deterministic technical indicator calculation and entry signal eva
 """
 
 import asyncio
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 import numpy as np
 import pandas as pd
