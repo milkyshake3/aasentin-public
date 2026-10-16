@@ -8,7 +8,7 @@ AI-assisted news analysis.
 advice, it does not guarantee profits, and it should not be used with real money.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://github.com/milkyshake3/aasentin-trade-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/milkyshake3/aasentin-trade-bot/actions/workflows/tests.yml)
+[![Tests](https://github.com/milkyshake3/aasentin-public/actions/workflows/tests.yml/badge.svg)](https://github.com/milkyshake3/aasentin-public/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## What it does
