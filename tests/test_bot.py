@@ -1413,14 +1413,10 @@ async def test_hourly_summary_worker_lifecycle(tmp_path):
 # Trade History Isolation & Reset Tests
 # =====================================================================
 
-def test_trade_history_json_empty_baseline():
-    """Verify that root trade_history.json exists and is reset to empty list []."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    trade_file = os.path.join(root_dir, "trade_history.json")
-    assert os.path.exists(trade_file)
-    with open(trade_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    assert data == []
+def test_missing_trade_history_starts_empty(tmp_path):
+    """Verify a fresh checkout treats absent runtime history as empty."""
+    trade_file = str(tmp_path / "trade_history.json")
+    assert load_trades(trade_file) == []
 
 
 def test_record_trade_isolates_mock_exchange_to_mock_file(tmp_path, monkeypatch):
@@ -1468,6 +1464,5 @@ def test_sentinel_trader_trade_history_file_resolution():
     config_live = Config(mock_exchange=False, binance_api_key="k", binance_api_secret="s")
     bot_live = SentinelTrader(config_live)
     assert bot_live.trade_history_file == "trade_history.json"
-
 
 

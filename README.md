@@ -1,422 +1,185 @@
-# Sentinel-Trader 🛡️
+# Sentinel-Trader
+
+Sentinel-Trader is an educational Python project for experimenting with automated
+crypto trading. It uses technical indicators, rule-based risk controls, and optional
+AI-assisted news analysis.
+
+**The default way to use this project is local simulation.** It is not financial
+advice, it does not guarantee profits, and it should not be used with real money.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
-[![Binance API](https://img.shields.io/badge/exchange-Binance%20Testnet%20%7C%20Live-F0B90B.svg?style=flat&logo=binance&logoColor=black)](https://testnet.binance.vision/)
-[![Pydantic v2](https://img.shields.io/badge/validation-Pydantic%20v2-E92063.svg?style=flat&logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
-[![Gemini AI](https://img.shields.io/badge/AI%20Sentinel-Google%20Gemini%20%7C%20OpenAI-8E75C2.svg?style=flat&logo=google&logoColor=white)](https://ai.google.dev/)
-[![Tests](https://img.shields.io/badge/tests-86%20passed-success.svg?style=flat&logo=pytest&logoColor=white)](#-testing--verification)
+[![Tests](https://github.com/milkyshake3/aasentin-trade-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/milkyshake3/aasentin-trade-bot/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Sentinel-Trader** is an institutional-grade, modular, autonomous crypto risk-mitigation and quantitative spot trading bot in Python. It pairs a **100% deterministic mathematical execution engine** with an **isolated AI threat sentinel** to protect spot capital against market dumps, protocol exploits, and catastrophic flash crashes.
+## What it does
 
-The bot features a **Dual-Client Architecture** that decouples live market data ingestion from sandbox order execution, a **dynamic universe screener** with diagnostic scan logging, automated **Discord webhook reporting**, and crash-resilient **atomic state persistence**.
+The bot follows a simple state machine:
 
----
+1. Look for a possible entry using an EMA trend filter and RSI pullback signal.
+2. Open a simulated or testnet position.
+3. Protect the position with take-profit and stop-loss rules.
+4. Optionally inspect crypto news for severe threats.
+5. Record the result and continue scanning.
 
-## 📑 Table of Contents
+The AI is only used for news threat analysis. It does not choose position sizes,
+calculate order prices, or receive exchange credentials directly.
 
-- [Core Highlights](#-core-highlights)
-- [System Architecture](#-system-architecture)
-- [Safety Invariants](#-safety-invariants-absolute-rules)
-- [Key Features](#-key-features)
-  - [Dual-Client Market Engine](#1-dual-client-market-engine)
-  - [Dynamic Strategy & Diagnostic Scanner](#2-dynamic-strategy--diagnostic-scanner)
-  - [AI Threat Sentinel & News Watcher](#3-ai-threat-sentinel--news-watcher)
-  - [Deterministic Risk & Liquidation Engine](#4-deterministic-risk--liquidation-engine)
-  - [Discord Notifier & Hourly Reporting](#5-discord-notifier--hourly-reporting)
-  - [Atomic Persistence & Crash Recovery](#6-atomic-persistence--crash-recovery)
-- [Project Directory Structure](#-project-directory-structure)
-- [Quickstart Guide](#-quickstart-guide)
-  - [1. Prerequisites](#1-prerequisites)
-  - [2. Installation](#2-installation)
-  - [3. Environment Configuration](#3-environment-configuration)
-  - [4. Verify Credentials & Connections](#4-verify-credentials--connections)
-  - [5. Run Interactive Simulation Scenarios](#5-run-interactive-simulation-scenarios)
-  - [6. Launch Live / Testnet Bot](#6-launch-live--testnet-bot)
-- [Configuration Reference](#-configuration-reference)
-- [CLI Arguments & Run Modes](#-cli-arguments--run-modes)
-- [Testing & Verification](#-testing--verification)
-- [Risk Disclaimer](#-risk-disclaimer)
+## Quick start
 
----
+### 1. Install
 
-## 🌟 Core Highlights
+You need Python 3.10 or newer.
 
-- **Deterministic Execution:** Order sizing, limit calculations, and slippage guards are 100% pure mathematical code—the AI never touches API credentials or calculates lot sizes.
-- **Dual-Client Exchange Routing:** Ingests live production candles and tickers to calculate genuine RSI/EMA indicators while safely routing order executions to the Binance Testnet sandbox.
-- **AI-Augmented Emergency Panic Selling:** Analyzes breaking crypto news headlines with SHA-256 deduplication via Google Gemini (`gemini-3.1-flash-lite`) or OpenAI (`gpt-4o-mini`).
-- **Diagnostic Scanner Logging:** Produces human-readable, per-pair rejection and pass rationale at every candle evaluation.
-- **Fail-Safe Fallback:** If an LLM call times out or returns malformed data, the bot safely defaults to `HOLD` and defers strictly to hard mathematical stop-loss limits.
-- **Slippage-Bounded Liquidation:** Executes limit IOC (Immediate-or-Cancel) orders bounded against the top bid with safety fee buffers.
+Windows PowerShell:
 
----
-
-## 🏗️ System Architecture
-
-```mermaid
-flowchart TD
-    subgraph MarketData [Live Binance Production Feed]
-        MD[ccxt.binance: Live Unauthenticated] -->|fetch_tickers / fetch_ohlcv| Screener[Dynamic Universe Screener]
-    end
-
-    subgraph StrategyEngine [Strategy & Signal Evaluation]
-        Screener -->|Top 15 Pairs by 24h Volume| Ind[Indicators: EMA100 + RSI 38.0]
-        Ind -->|Diagnostic Evaluation| ScanLog[Scan Diagnostics Logger]
-        Ind -->|Signal Detected| BuySignal{Pass Trend & RSI Cross?}
-    end
-
-    subgraph NewsSentinel [AI Threat Watcher]
-        RSS[Crypto RSS Feeds] --> Hash[SHA-256 Dedup Cache]
-        Hash --> Fresh[Freshness Filter < 30m]
-        Fresh --> LLM[Google Gemini / OpenAI Structured Schema]
-        LLM --> ThreatEval{Threat >= HIGH and Conf >= 0.70?}
-    end
-
-    subgraph RiskEngine [100% Deterministic Risk Engine]
-        BuySignal -->|Yes| FSM_Enter[FSM: ENTERING]
-        FSM_Enter --> ExecBuy[Idempotent Market Buy]
-        ExecBuy --> InPos[FSM: IN_POSITION]
-        InPos --> RiskCheck{Position Risk Check}
-        RiskCheck -->|PnL <= -2.5%| StopLoss[Hard Stop-Loss Triggered]
-        RiskCheck -->|PnL >= +5.0%| TakeProfit[Hard Take-Profit Triggered]
-        ThreatEval -->|Yes: Black Swan / Exploit| PanicSell[AI Emergency Panic Sell]
-    end
-
-    subgraph ExecutionClient [Binance Order Exchange]
-        StopLoss --> Liquidate[Slippage-Bounded Limit IOC Liquidation]
-        TakeProfit --> Liquidate
-        PanicSell --> Liquidate
-        Liquidate --> OrderClient[ccxt.binance: Authenticated Sandbox / Live]
-    end
-
-    subgraph AlertsAnalytics [Observability & Persistence]
-        Liquidate --> Discord[Discord Webhook Alerts & Hourly Summaries]
-        Liquidate --> Store[Atomic State Store & Trade History]
-    end
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
----
-
-## 🔒 Safety Invariants (Absolute Rules)
-
-1. **AI Isolation:** The AI sentiment model **NEVER** determines order size, calculates prices, or interacts with exchange APIs directly. It only outputs structured threat assessments (`HOLD` vs `PANIC_SELL`).
-2. **Deterministic Risk Engine:** Order routing and limit evaluations are **100% deterministic code**. Position liquidation is governed purely by exchange balances, lot precision, and mathematical thresholds.
-3. **Binance Testnet by Default:** Operates strictly on Binance Testnet (Sandbox Mode). Live production trading requires explicit double-confirmation (`BINANCE_SANDBOX=False` AND `ALLOW_PRODUCTION_TRADING=True`).
-4. **Fail-Safe Fallbacks:** If an LLM call fails, times out, or returns invalid JSON, the bot fails safe: it logs the incident and defers strictly to hard mathematical stop-losses.
-5. **Idempotent Order Sizing:** All orders check current balances and filter constraints (LOT_SIZE step, MIN_NOTIONAL) prior to submission, preventing balance exhaustion or order rejection.
-
----
-
-## ⚡ Key Features
-
-### 1. Dual-Client Market Engine
-
-Cryptocurrency testnets often suffer from low liquidity, abnormal spreads, and stale price feeds. Sentinel-Trader solves this by decoupling data ingestion from order execution:
-
-- **`data_exchange`**: A public, unauthenticated CCXT client targeting live production Binance endpoints (`sandbox=False`). Used strictly for `fetch_tickers()`, `fetch_ohlcv()`, and ticker prices. Indicators (RSI, EMA) reflect genuine global market action.
-- **`order_exchange`**: An authenticated CCXT client configured with user API keys and sandbox settings (`BINANCE_SANDBOX=True`). Used strictly for balance queries, lot-size precision formatting, and order execution (`execute_market_buy_idempotent`, `liquidate_to_usdt`).
-
-### 2. Dynamic Strategy & Diagnostic Scanner
-
-Sentinel-Trader dynamically scans the top liquid pairs by 24h quote volume and applies quantitative trend and momentum criteria:
-
-- **Trend Filter:** Price must be strictly above the Exponential Moving Average (`EMA_PERIOD=100`).
-- **Momentum Pullback:** The Relative Strength Index (`RSI_OVERSOLD_THRESHOLD=38.0`) must cross upward from at or below the oversold threshold.
-- **Diagnostic Logging:** Every candle evaluation generates transparent logs detailing why pairs were rejected or selected:
-
-```text
-[SCAN DIAGNOSTICS] 15 pairs evaluated:
-• BTC/USDT: Price $64,120 < EMA $64,800 [REJECT: Below EMA100]
-• ETH/USDT: Price $2,640 > EMA $2,580 | RSI 52.4 [REJECT: RSI not crossing 38]
-• SOL/USDT: Price $152 > EMA $148 | RSI 36.1 (was 32.4) [PASS: Signal Found]
-[SCAN RESULT] 1/15 passed entry criteria.
-```
-
-If no pairs qualify, the bot safely preserves capital:
-```text
-[SCAN RESULT] 0/15 passed entry criteria. Maintaining 100% Cash.
-```
-
-### 3. AI Threat Sentinel & News Watcher
-
-The AI Sentinel ingests live crypto headlines and evaluates systemic threats using structured Pydantic schemas:
-
-```python
-class NewsAnalysis(BaseModel):
-    action: Literal["HOLD", "PANIC_SELL"]
-    threat_level: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    confidence: float  # 0.0 to 1.0
-    reasoning: str
-```
-
-- **Emergency Gating:** A `PANIC_SELL` is only routed if `threat_level` is `HIGH` or `CRITICAL` **and** `confidence >= PANIC_SELL_CONFIDENCE_THRESHOLD` (default: 0.70).
-- **Deduplication & Freshness:** All ingested headlines pass through an in-memory SHA-256 deduplication cache and a 30-minute freshness filter to eliminate redundant LLM calls.
-- **Fail-Safe Fallback:** Any network failure, parsing error, or timeout immediately returns `HOLD` with confidence `0.0`.
-
-### 4. Deterministic Risk & Liquidation Engine
-
-- **Hard Take-Profit:** Automatically liquidates when unrealized PnL reaches `+5.0%` (configurable via `TAKE_PROFIT_PCT`).
-- **Hard Stop-Loss:** Mathematically liquidates when unrealized PnL drops to `-2.5%` (configurable via `STOP_LOSS_PCT`).
-- **Limit IOC Slippage Bounding:** In `limit_ioc` mode, liquidations place Immediate-or-Cancel limit orders at `(best_bid * (1 - MAX_LIQUIDATION_SLIPPAGE_PCT))`, preventing catastrophic fills during extreme market illiquidity.
-- **Fee Buffer:** Deducts a safety fee allowance (`FEE_BUFFER_PCT=0.001`) to protect against lot-size errors when fees are deducted in the base asset.
-
-### 5. Discord Notifier & Hourly Reporting
-
-- **Real-Time Embeds:** Sends formatted Discord webhook alerts for buys, stop-loss liquidations, take-profit executions, and AI threat activations.
-- **Hourly Summaries:** Automatically generates performance summaries aligned to the top of the hour, tracking unrealized PnL, active positions, realized profits, and win rate.
-
-### 6. Atomic Persistence & Crash Recovery
-
-- **Atomic Writes:** State is persisted to `state.json` and `trade_history.json` using temporary files and atomic rename operations to prevent file corruption during sudden power loss.
-- **Cold Boot Rehydration:** If the bot restarts, it immediately scans for existing open positions on the exchange and resumes risk management without orphaned orders.
-
----
-
-## 📁 Project Directory Structure
-
-```text
-aasentin-trade-bot/
-├── .env.example                          # Environment variables template
-├── requirements.txt                      # Project dependencies
-├── README.md                             # Comprehensive GitHub documentation
-├── verify_connections.py                 # Interactive connectivity test suite
-├── trade_history.json                    # Persisted trade log and performance history
-│
-├── sentinel_trader/                      # Core Bot Package
-│   ├── __init__.py                       # Package metadata and version info
-│   ├── __main__.py                       # Package execution entrypoint
-│   ├── config.py                         # Pydantic Settings & safety validators
-│   ├── exchange_client.py                # Dual CCXT client (live data + order execution)
-│   ├── strategy.py                       # RSI/EMA logic & diagnostic scanner
-│   ├── universe_screener.py              # Dynamic top-volume pair screener
-│   ├── risk_engine.py                    # 100% deterministic risk & liquidation engine
-│   ├── ai_sentinel.py                    # LLM structured news threat analysis
-│   ├── news_watcher.py                   # RSS ingestion & SHA-256 deduplication
-│   ├── notifier.py                       # Discord webhook integration & hourly reports
-│   ├── state_store.py                    # Atomic state persistence
-│   ├── analytics.py                      # Trade metrics, win-rate & PnL reporting
-│   ├── main.py                           # Autonomous FSM event loop orchestrator
-│   └── test_bot.py                       # Unit & integration test suite
-│
-└── test_*.py                             # Specialized test suites
-    ├── test_dual_client_and_diagnostics.py
-    ├── test_screener.py
-    ├── test_strategy.py
-    ├── test_notifier.py
-    ├── test_news_stream.py
-    └── test_hourly_summary.py
-```
-
----
-
-## 🚀 Quickstart Guide
-
-### 1. Prerequisites
-
-- **Python 3.10+** (Tested on Python 3.10, 3.11, 3.12, 3.14)
-- **Binance Testnet Account:** Generate keys at [testnet.binance.vision](https://testnet.binance.vision/)
-- **LLM API Key (Optional):** Google Gemini API key from [Google AI Studio](https://aistudio.google.com/) or OpenAI API key
-
-### 2. Installation
+macOS/Linux:
 
 ```bash
-# Clone the repository
-git clone https://github.com/milkyshake3/aasentin-trade-bot.git
-cd aasentin-trade-bot
-
-# Create and activate a virtual environment
-# On Linux / macOS:
 python3 -m venv .venv
 source .venv/bin/activate
-
-# On Windows (PowerShell):
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration
+### 2. Create a local configuration
 
-Copy the template file to `.env`:
+Copy the example file. On Windows PowerShell:
 
-```bash
-cp .env.example .env
+```powershell
+Copy-Item .env.example .env
 ```
 
-Edit `.env` with your preferred configuration:
+For a first run, use simulation mode. These settings do not need API keys:
 
 ```env
-# Binance API Credentials (Testnet)
+MOCK_EXCHANGE=True
+LLM_PROVIDER=mock
 BINANCE_API_KEY=replace_with_testnet_api_key
 BINANCE_API_SECRET=replace_with_testnet_api_secret
+LLM_API_KEY=replace_with_llm_api_key
 BINANCE_SANDBOX=True
 ALLOW_PRODUCTION_TRADING=False
-
-# LLM Sentinel Configuration
-LLM_PROVIDER=gemini                     # 'gemini', 'openai', or 'mock'
-LLM_API_KEY=replace_with_llm_api_key
-GEMINI_MODEL=gemini-3.1-flash-lite
-
-# Trading & Risk Parameters
-TARGET_SYMBOL=SOL/USDT
-TIMEFRAME=15m
-TAKE_PROFIT_PCT=0.05                    # +5.0%
-STOP_LOSS_PCT=0.025                     # -2.5%
-RSI_OVERSOLD_THRESHOLD=38.0             # Sensitive pullback trigger
-EMA_PERIOD=100                          # Responsive trend filter
-
-# Portfolio & Screener
-DYNAMIC_UNIVERSE_SIZE=15                # Top 15 liquid pairs
-MAX_ACTIVE_POSITIONS=3                  # Max 3 concurrent positions
-SLOT_ALLOCATION_PCT=0.25                # 25% of free USDT per position
-
-# Optional Discord Alerts
-DISCORD_WEBHOOK_URL=
-HOURLY_SUMMARY_ENABLED=True
 ```
 
-### 4. Verify Credentials & Connections
+Never commit `.env`, API keys, exchange secrets, or Discord webhook URLs.
 
-Run the connection test script to validate your Binance credentials and LLM threat detection before starting live trading:
+### 3. Run a simulation
 
-```bash
-python verify_connections.py
-```
+This example runs a complete simulated trading cycle:
 
-### 5. Run Interactive Simulation Scenarios
-
-Test the bot locally in memory with built-in scenario simulations without consuming exchange balances or LLM tokens:
-
-```bash
-# 1. Take-Profit Breach Simulation (Price pumps to +5% limit)
-python -m sentinel_trader.main --scenario take_profit --poll-interval 0.5
-
-# 2. Hard Stop-Loss Breach Simulation (Price dumps to -2.5% limit)
-python -m sentinel_trader.main --scenario stop_loss --poll-interval 0.5
-
-# 3. AI Emergency Panic Sell Simulation (Simulates critical exploit headline)
-python -m sentinel_trader.main --scenario ai_panic --poll-interval 0.5
-
-# 4. Fail-Safe Simulation (Malformed JSON falls back to HOLD and defers to math limits)
-python -m sentinel_trader.main --scenario failsafe --poll-interval 0.5
-
-# 5. Realistic Market Walk Simulation (Geometric Brownian Motion)
-python -m sentinel_trader.main --scenario market_walk --poll-interval 0.5
-
-# 6. Full Autonomous FSM Cycle (Scanning -> Entry -> Position -> Exit -> Cooldown)
+```powershell
 python -m sentinel_trader.main --scenario fsm_cycle --poll-interval 0.5
 ```
 
-### 6. Launch Live / Testnet Bot
+Other useful scenarios are:
 
-Run the autonomous trading loop on Binance Testnet:
-
-```bash
-python -m sentinel_trader.main
+```powershell
+python -m sentinel_trader.main --scenario take_profit --poll-interval 0.5
+python -m sentinel_trader.main --scenario stop_loss --poll-interval 0.5
+python -m sentinel_trader.main --scenario ai_panic --poll-interval 0.5
+python -m sentinel_trader.main --scenario failsafe --poll-interval 0.5
 ```
 
-To run in the background on a server:
-```bash
-nohup python -m sentinel_trader.main > sentinel.log 2>&1 &
+These scenarios use the in-memory mock exchange and do not trade real funds.
+
+## Run the tests
+
+```powershell
+python -m pytest -q
 ```
 
----
+The tests cover the strategy, exchange routing, risk controls, news handling,
+notifications, persistence, and simulated trading flows.
 
-## ⚙️ Configuration Reference
-
-| Environment Variable | Type | Default | Description |
-|---|---|---|---|
-| `BINANCE_API_KEY` | `str` | `""` | Binance API Key |
-| `BINANCE_API_SECRET` | `str` | `""` | Binance API Secret |
-| `BINANCE_SANDBOX` | `bool` | `True` | **Safety Invariant:** Default strictly to Testnet |
-| `ALLOW_PRODUCTION_TRADING` | `bool` | `False` | **Safety Lock:** Explicit permission required for live trading |
-| `LLM_PROVIDER` | `str` | `gemini` | `gemini`, `openai`, or `mock` |
-| `LLM_API_KEY` | `str` | `""` | API key for Gemini or OpenAI |
-| `GEMINI_MODEL` | `str` | `gemini-3.1-flash-lite` | Gemini model name |
-| `TARGET_SYMBOL` | `str` | `SOL/USDT` | Default primary trading pair |
-| `TIMEFRAME` | `str` | `15m` | Candle timeframe for indicator calculations |
-| `DYNAMIC_UNIVERSE_SIZE` | `int` | `15` | Number of top-volume pairs to screen |
-| `MAX_ACTIVE_POSITIONS` | `int` | `3` | Maximum concurrent active trading slots |
-| `SLOT_ALLOCATION_PCT` | `float` | `0.25` | Fraction of free USDT allocated per slot (25%) |
-| `TAKE_PROFIT_PCT` | `float` | `0.05` | Hard Take-Profit threshold (+5.0%) |
-| `STOP_LOSS_PCT` | `float` | `0.025` | Hard Stop-Loss threshold (-2.5%) |
-| `RSI_OVERSOLD_THRESHOLD` | `float` | `38.0` | Oversold threshold for RSI pullback entry |
-| `EMA_PERIOD` | `int` | `100` | Trend filter lookback period |
-| `COOLDOWN_MINUTES` | `int` | `15` | Cooldown period after exit before re-entering |
-| `PANIC_SELL_CONFIDENCE_THRESHOLD` | `float` | `0.70` | Minimum AI confidence to trigger panic sell |
-| `LIQUIDATION_ORDER_TYPE` | `str` | `limit_ioc` | `limit_ioc` (slippage bounded) or `market` |
-| `MAX_LIQUIDATION_SLIPPAGE_PCT` | `float` | `0.02` | Maximum slippage bound for IOC orders (2%) |
-| `FEE_BUFFER_PCT` | `float` | `0.001` | Safety buffer for fees deducted in base asset (0.1%) |
-| `POLL_INTERVAL_SECONDS` | `float` | `3.0` | Price monitoring cadence |
-| `NEWS_POLL_INTERVAL_SECONDS` | `float` | `5.0` | News ingestion polling cadence |
-| `MAX_NEWS_AGE_MINUTES` | `int` | `30` | Freshness cutoff: ignore older headlines |
-| `DISCORD_WEBHOOK_URL` | `str` | `""` | Incoming Discord webhook URL |
-| `HOURLY_SUMMARY_ENABLED` | `bool` | `True` | Send automated hourly performance summaries |
-
----
-
-## 💻 CLI Arguments & Run Modes
-
-`sentinel_trader.main` supports extensive command-line overrides for flexible testing and automation:
+## Project layout
 
 ```text
-usage: python -m sentinel_trader.main [-h] [--scenario {default,continuous,take_profit,stop_loss,ai_panic,failsafe,market_walk,fsm_cycle}]
-                                      [--initial-state {CASH_SCANNING,ENTERING,IN_POSITION,COOLDOWN}]
-                                      [--mock [MOCK]] [--symbol SYMBOL] [--entry-price ENTRY_PRICE]
-                                      [--poll-interval POLL_INTERVAL] [--max-news-age MAX_NEWS_AGE]
-                                      [--max-cycles MAX_CYCLES] [--state-file STATE_FILE]
-                                      [--trade-history-file TRADE_HISTORY_FILE]
+sentinel_trader/
+├── main.py              # Command-line app and trading state machine
+├── config.py            # Environment settings and safety validation
+├── strategy.py          # RSI/EMA entry logic
+├── exchange_client.py   # Mock and Binance exchange clients
+├── risk_engine.py       # Stop-loss, take-profit, and liquidation rules
+├── universe_screener.py # Selects liquid trading pairs
+├── ai_sentinel.py       # Optional AI news threat analysis
+├── news_watcher.py      # Crypto news collection and filtering
+├── state_store.py       # Crash-safe local state
+├── analytics.py         # Trade history and performance metrics
+└── notifier.py          # Optional Discord alerts
+
+tests/                   # Automated tests
+.env.example             # Safe configuration template
+requirements.txt         # Python dependencies
 ```
 
-### Examples
+Runtime state, trade history, logs, caches, virtual environments, and local
+credentials are intentionally ignored by Git.
 
-```bash
-# Run on a custom pair with custom poll frequency:
-python -m sentinel_trader.main --symbol BTC/USDT --poll-interval 2.0
+## How the strategy works
 
-# Force fully in-memory mock mode:
-python -m sentinel_trader.main --mock True
+- **EMA trend filter:** the price must be above the configured EMA.
+- **RSI pullback signal:** the strategy looks for an upward move from an oversold
+  RSI value.
+- **Take profit:** the default target is `+5%`.
+- **Stop loss:** the default limit is `-2.5%`.
+- **Cooldown:** after a position closes, the bot waits before scanning again.
 
-# Run 10 cycles of the autonomous FSM:
-python -m sentinel_trader.main --scenario fsm_cycle --max-cycles 10
+These values are educational examples, not recommendations.
+
+## Optional Binance Testnet use
+
+After testing the simulations, you can connect to Binance Testnet with newly
+generated testnet credentials:
+
+1. Create keys at [Binance Testnet](https://testnet.binance.vision/).
+2. Put them only in your local `.env`.
+3. Keep `BINANCE_SANDBOX=True`.
+4. Keep `ALLOW_PRODUCTION_TRADING=False`.
+5. Verify the code and testnet behavior before considering anything else.
+
+To check configured connections:
+
+```powershell
+python verify_connections.py
 ```
 
----
+Never use production credentials while learning or testing this project. Use
+fresh Binance Testnet credentials stored only in your local `.env`, and revoke
+and regenerate any credentials that may have been exposed before publishing or
+using them again.
 
-## 🧪 Testing & Verification
+## Configuration
 
-Sentinel-Trader includes a comprehensive test suite with **86 unit and integration test cases** covering all critical components:
+The most useful settings are:
 
-- **Dual-Client Routing:** Verifies market data calls hit public production Binance endpoints while order actions target Sandbox.
-- **Diagnostic Logging:** Tests candidate evaluation output formatting and cash preservation messages.
-- **Safety Invariants:** Validates that live trading cannot be triggered without explicit confirmation flags.
-- **Mock LLM Fallbacks:** Validates parser recovery when LLMs return invalid formatting or network timeouts occur.
-- **Precision & Slippage:** Tests lot-size step snapping, MIN_NOTIONAL thresholds, and IOC limit pricing.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `MOCK_EXCHANGE` | `False` | Use the in-memory exchange when `True` |
+| `BINANCE_SANDBOX` | `True` | Keep exchange orders on Binance Testnet |
+| `ALLOW_PRODUCTION_TRADING` | `False` | Safety lock for production trading |
+| `TARGET_SYMBOL` | `SOL/USDT` | Primary symbol |
+| `TIMEFRAME` | `15m` | Candle timeframe |
+| `TAKE_PROFIT_PCT` | `0.05` | Take-profit threshold |
+| `STOP_LOSS_PCT` | `0.025` | Stop-loss threshold |
+| `LLM_PROVIDER` | `gemini` | `gemini`, `openai`, or `mock` |
+| `DISCORD_WEBHOOK_URL` | empty | Optional alert webhook |
 
-Run the test suite with pytest:
+See [`.env.example`](.env.example) for the complete list.
 
-```bash
-# Run all tests
-pytest -v
+## Safety notes
 
-# Run with coverage report
-pytest --cov=sentinel_trader -v
-```
+- This project is for education and experimentation.
+- Cryptocurrency trading can result in the loss of money.
+- Test with simulations and Binance Testnet first.
+- Never commit credentials.
+- Review the source code yourself before connecting any exchange account.
+- Live trading requires explicit configuration and is disabled by default.
 
----
+## License
 
-## ⚠️ Risk Disclaimer
-
-**Sentinel-Trader is software for educational and algorithmic research purposes.**
-
-- Cryptocurrency trading involves substantial financial risk and can result in the loss of your capital.
-- Always thoroughly test your strategy using the built-in mock scenarios and Binance Testnet sandbox before deploying real funds.
-- Never trade with funds you cannot afford to lose. The developers assume no responsibility for trading losses incurred through the use of this software.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is available under the [MIT License](LICENSE).
