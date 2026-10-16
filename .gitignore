@@ -7,6 +7,8 @@
 !.env.example
 *.pem
 *.key
+*.crt
+*.p12
 credentials.json
 
 # ==========================================
@@ -64,10 +66,13 @@ news_cache.json
 # 5. Testing & Profiling
 # ==========================================
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
 .coverage.*
 htmlcov/
 .hypothesis/
+coverage.xml
 
 # ==========================================
 # 6. IDEs & Operating System Artifacts
