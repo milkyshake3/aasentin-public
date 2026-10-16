@@ -1,0 +1,10 @@
+# Auto detect text files and perform line ending normalization
+* text=auto
+
+# Declare text files explicitly
+*.md text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.env.example text eol=lf
+.gitignore text eol=lf

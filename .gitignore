@@ -1,0 +1,87 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+# ==========================================
+# 1. CRITICAL: API Keys, Secrets & Credentials
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+
+# ==========================================
+# 2. Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# 3. Python Bytecode & Cache
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 4. Trading State, SQLite DBs & Logs
+# ==========================================
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+state.json
+trade_history.json
+trade_history_mock.json
+asset_scores.json
+asset_scores_mock.json
+order_history/
+news_cache.json
+.cache/
+
+# ==========================================
+# 5. Testing & Profiling
+# ==========================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+coverage.xml
+
+# ==========================================
+# 6. IDEs & Operating System Artifacts
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
